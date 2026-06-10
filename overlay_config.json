@@ -1,0 +1,12 @@
+{
+  "x": 1651,
+  "y": 950,
+  "locked": false,
+  "opacity": 0.75,
+  "font_size": 11,
+  "refresh_interval": 5,
+  "wifi_categories": {
+    "EVA初号机": "green",
+    "wjw21026": "red"
+  }
+}
