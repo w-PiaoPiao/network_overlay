@@ -407,8 +407,12 @@ AUTO_START_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def _get_auto_start_cmd():
-    """生成开机自启的命令行（当前 pythonw + 本脚本的绝对路径）"""
-    return f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+    """生成开机自启的命令行（exe 版本直接指向自身，脚本版本指向 pythonw + 脚本）"""
+    exe_path = os.path.abspath(sys.argv[0])
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后，直接指向 exe 自身
+        return f'"{exe_path}"'
+    return f'"{sys.executable}" "{exe_path}"'
 
 
 def set_auto_start(enable):

@@ -9,6 +9,16 @@ __pycache__/
 # Lock files
 .overlay.lock
 
+# Build artifacts
+dist/
+build/
+*.spec
+*.zip
+*.exe
+
+# Version info (local)
+version_info.txt
+
 # IDE
 .vscode/
 .idea/
