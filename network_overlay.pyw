@@ -27,6 +27,7 @@ import ctypes
 import ctypes.wintypes
 import atexit
 import threading
+import winreg
 
 # ── 路径 ──────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
@@ -376,6 +377,7 @@ def load_config():
         "opacity": 0.75,
         "font_size": 11,
         "refresh_interval": 5,
+        "auto_start": False,
         "wifi_categories": {},  # SSID → "green" | "red"，新 WiFi 默认 "red"
     }
     try:
@@ -400,10 +402,57 @@ def lock_icon(locked):
     return "🔒" if locked else "🔓"
 
 
+# ── 开机自启管理 ──────────────────────────────────────
+AUTO_START_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def _get_auto_start_cmd():
+    """生成开机自启的命令行（当前 pythonw + 本脚本的绝对路径）"""
+    return f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+
+
+def set_auto_start(enable):
+    """设置或取消开机自启（当前用户 HKCU，无需管理员权限）"""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTO_START_REG_KEY,
+                             0, winreg.KEY_SET_VALUE)
+        if enable:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, _get_auto_start_cmd())
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
+
+def is_auto_start_enabled():
+    """检查当前是否已设置开机自启"""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTO_START_REG_KEY,
+                             0, winreg.KEY_READ)
+        try:
+            val, regtype = winreg.QueryValueEx(key, APP_NAME)
+            return val == _get_auto_start_cmd()
+        except FileNotFoundError:
+            return False
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return False
+
+
 # ── 主窗口类 ──────────────────────────────────────────
 class NetworkOverlay:
     def __init__(self):
         self.config = load_config()
+        # 启动时同步实际注册表状态到配置（防止手动删除注册表后配置残留）
+        actual = is_auto_start_enabled()
+        if self.config.get("auto_start") != actual:
+            self.config["auto_start"] = actual
+            save_config(self.config)
         self._exiting = False
         self._mgmt_window = None  # WiFi 管理窗口引用
 
@@ -498,6 +547,10 @@ class NetworkOverlay:
         self.context_menu.add_separator()
         self.context_menu.add_command(label="🔄 手动刷新", command=self._refresh_network)
         self.context_menu.add_command(label="📋 管理 WiFi 分类", command=self._open_wifi_manager)
+        self.context_menu.add_command(
+            label="☑ 开机自动启动" if self.config.get("auto_start") else "☐ 开机自动启动",
+            command=self._toggle_auto_start
+        )
         self.context_menu.add_separator()
         self.context_menu.add_command(label="📍 重置位置到右上角", command=self._reset_position)
         self.context_menu.add_separator()
@@ -638,6 +691,14 @@ class NetworkOverlay:
     def _set_refresh_interval(self, sec):
         self.config["refresh_interval"] = sec
         save_config(self.config)
+
+    def _toggle_auto_start(self):
+        """切换开机自启状态"""
+        new_state = not self.config.get("auto_start", False)
+        set_auto_start(new_state)
+        self.config["auto_start"] = new_state
+        save_config(self.config)
+        self._build_context_menu()  # 重建菜单以更新 ☐/☑ 标识
 
     def _refresh_network(self):
         """刷新网络状态显示"""
