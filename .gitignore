@@ -9,6 +9,9 @@ __pycache__/
 # Lock files
 .overlay.lock
 
+# Runtime config (local machine data)
+overlay_config.json
+
 # Build artifacts
 dist/
 build/

@@ -369,7 +369,7 @@ def _query_network():
 
 
 # ── 后台采样线程 ──────────────────────────────────────
-_NET_CACHE = ("检测中...", False, None)  # (display_text, is_wifi, ssid)
+_NET_CACHE = ("检测中...", False, None, 0)  # (display_text, is_wifi, ssid, signal)
 _NET_LOCK = threading.Lock()
 _NET_STOP = threading.Event()
 _NET_THREAD = None
@@ -383,11 +383,11 @@ def _sampler_loop():
     while not _NET_STOP.is_set():
         try:
             data = _query_network()
-            display_text, is_wifi, ssid = _parse_network_data(data)
+            display_text, is_wifi, ssid, signal = _parse_network_data(data)
         except Exception:
-            display_text, is_wifi, ssid = ("❌ 无网络连接", False, None)
+            display_text, is_wifi, ssid, signal = ("无网络连接", False, None, 0)
         with _NET_LOCK:
-            _NET_CACHE = (display_text, is_wifi, ssid)
+            _NET_CACHE = (display_text, is_wifi, ssid, signal)
         _NET_STOP.wait(_get_sampling_interval())
 
 
@@ -414,38 +414,22 @@ def _get_sampling_interval():
 
 
 def _parse_network_data(data):
-    """将查询结果解析为 (display_text, is_wifi, ssid)。"""
+    """将查询结果解析为 (display_text, is_wifi, ssid, signal)。"""
     net_type = data.get("Type", "none")
     name = data.get("Name", "")
     signal = data.get("Signal", 0)
 
     if net_type == "wifi" and name:
-        if signal and signal > 0:
-            if signal >= 80:
-                bars = "▂▄▆█"
-            elif signal >= 60:
-                bars = "▂▄▆▁"
-            elif signal >= 40:
-                bars = "▂▄▁▁"
-            elif signal >= 20:
-                bars = "▂▁▁▁"
-            else:
-                bars = "▁▁▁▁"
-        else:
-            bars = "▂▄▆█"
-        return f"📶 {bars}  {name}", True, name
+        return name, True, name, signal
 
     if net_type == "other" and name:
-        if "以太网" in name or "Ethernet" in name:
-            return f"🔌 {name}", False, name
-        else:
-            return f"🌐 {name}", False, name
+        return name, False, name, 0
 
-    return "❌ 无网络连接", False, None
+    return "无网络连接", False, None, 0
 
 
 def get_network_status():
-    """获取缓存的网络状态。若采样线程未启动则启动。"""
+    """获取缓存的网络状态 (text, is_wifi, ssid, signal)。若采样线程未启动则启动。"""
     _ensure_sampler()
     with _NET_LOCK:
         return _NET_CACHE
@@ -466,7 +450,7 @@ def load_config():
         "y": None,
         "locked": False,
         "opacity": 0.75,
-        "font_size": 11,
+        "font_size": 9,
         "refresh_interval": 5,
         "auto_start": False,
         "wifi_categories": {},  # SSID → "green" | "red"，新 WiFi 默认 "red"
@@ -491,6 +475,63 @@ def save_config(cfg):
 
 def lock_icon(locked):
     return "🔒" if locked else "🔓"
+
+
+# ── 信号小图标绘制 ────────────────────────────────────
+_ICON_DARK = "#3d3d5c"
+
+
+def _signal_level(signal):
+    """信号强度 0-100 → 点亮格数 0-4"""
+    if signal >= 80:
+        return 4
+    if signal >= 60:
+        return 3
+    if signal >= 40:
+        return 2
+    if signal >= 20:
+        return 1
+    return 0
+
+
+def draw_signal_icon(canvas, icon_type, signal, color):
+    """在 Canvas 上绘制小图标。icon_type: "wifi" | "other" | "none" """
+    canvas.delete("all")
+    w = int(canvas["width"])
+    h = int(canvas["height"])
+
+    if icon_type == "wifi":
+        cx, cy = w / 2, h - 2.5          # 扇形圆心在底部中点
+        radii = [2.8, 4.9, 7.0, 9.1]     # 4 段弧半径递增
+        lit = _signal_level(signal)
+        for i, r in enumerate(radii):
+            if r > min(w, h) / 2 + 1:
+                break
+            arc_color = color if i < lit else _ICON_DARK
+            canvas.create_arc(
+                cx - r, cy - r, cx + r, cy + r,
+                start=45, extent=90, style=tk.ARC,
+                outline=arc_color, width=2.0,
+            )
+        canvas.create_oval(
+            cx - 1.5, cy - 1.5, cx + 1.5, cy + 1.5,
+            fill=color, outline=color,
+        )
+    elif icon_type == "other":
+        # 简化的以太网口:左侧插头线 + 右侧小矩形网口
+        bx1, by1, bx2, by2 = w / 2 + 1, h / 2 - 3, w - 3, h / 2 + 3
+        canvas.create_rectangle(
+            bx1, by1, bx2, by2,
+            fill=color, outline="", width=0,
+        )
+        canvas.create_line(bx1, by1, bx1, by2, fill=color)
+        for i in range(3):
+            ly = h / 2 - 2 + i * 2
+            canvas.create_line(2, ly, bx1 - 1, ly, fill=color)
+    else:
+        # 无网络:红色 ✕
+        canvas.create_line(3, 3, w - 3, h - 3, fill="#ff5252", width=2)
+        canvas.create_line(w - 3, 3, 3, h - 3, fill="#ff5252", width=2)
 
 
 # ── 开机自启管理 ──────────────────────────────────────
@@ -556,7 +597,7 @@ class NetworkOverlay:
         self.root.withdraw()
         self.root.title(APP_NAME)
         self.root.overrideredirect(True)
-        self.root.geometry("260x44")
+        self.root.geometry("1x28")
 
         # 使用纯色背景（不再用 transparentcolor，避免与扩展样式冲突）
         self.bg_color = "#1a1a2e"
@@ -593,11 +634,17 @@ class NetworkOverlay:
         )
         self.inner_frame.pack(fill=tk.BOTH, expand=True)
 
+        self.signal_canvas = tk.Canvas(
+            self.inner_frame, width=22, height=20,
+            bg=self.inner_bg, highlightthickness=0, bd=0,
+        )
+        self.signal_canvas.pack(side=tk.LEFT, padx=(5, 1), pady=1)
+
         self.net_label = tk.Label(
             self.inner_frame, text="检测中...",
             fg="#e0e0e0", bg=self.inner_bg,
             font=("Microsoft YaHei UI", self.config["font_size"], "bold"),
-            anchor="w", padx=8, pady=2,
+            anchor="w", padx=4, pady=1,
         )
         self.net_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -605,14 +652,14 @@ class NetworkOverlay:
         self.lock_btn = tk.Label(
             self.inner_frame, textvariable=self.lock_btn_text,
             fg="#a0a0a0", bg=self.inner_bg,
-            font=("Segoe UI Symbol", 12), padx=6, pady=2, cursor="hand2",
+            font=("Segoe UI Symbol", 10), padx=4, pady=1, cursor="hand2",
         )
         self.lock_btn.pack(side=tk.RIGHT)
 
         self.close_btn = tk.Label(
             self.inner_frame, text="✕",
             fg="#a0a0a0", bg=self.inner_bg,
-            font=("Segoe UI Symbol", 10), padx=4, pady=2, cursor="hand2",
+            font=("Segoe UI Symbol", 9), padx=3, pady=1, cursor="hand2",
         )
         self.close_btn.pack(side=tk.RIGHT)
 
@@ -654,12 +701,12 @@ class NetworkOverlay:
 
     # ── 事件绑定 ──────────────────────────────────
     def _bind_events(self):
-        for widget in [self.inner_frame, self.net_label]:
+        for widget in [self.inner_frame, self.net_label, self.signal_canvas]:
             widget.bind("<Button-1>", self._on_drag_start)
             widget.bind("<B1-Motion>", self._on_drag_motion)
             widget.bind("<ButtonRelease-1>", self._on_drag_end)
 
-        for widget in [self.inner_frame, self.net_label, self.lock_btn]:
+        for widget in [self.inner_frame, self.net_label, self.signal_canvas, self.lock_btn]:
             widget.bind("<Button-3>", self._show_context_menu)
 
         self.lock_btn.bind("<Button-1>", lambda e: None if self.config["locked"] else self._toggle_lock())
@@ -667,6 +714,7 @@ class NetworkOverlay:
 
         self.inner_frame.bind("<MouseWheel>", self._on_scroll)
         self.net_label.bind("<MouseWheel>", self._on_scroll)
+        self.signal_canvas.bind("<MouseWheel>", self._on_scroll)
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
 
     # ── Windows API ──────────────────────────────
@@ -687,16 +735,26 @@ class NetworkOverlay:
             pass
 
     # ── 位置 ──────────────────────────────────────
+    def _resize_to_content(self):
+        """按内容自适应窗口尺寸（宽度随文本伸缩，高度固定），位置保持不变"""
+        self.root.update_idletasks()
+        try:
+            w = max(120, self.main_frame.winfo_reqwidth())
+            h = max(28, self.main_frame.winfo_reqheight())
+            self.root.geometry(f"{w}x{h}")
+        except Exception:
+            pass
+
     def _set_initial_position(self):
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         x = self.config.get("x")
         y = self.config.get("y")
         if x is not None and y is not None:
-            x = max(0, min(x, screen_w - 260))
-            y = max(0, min(y, screen_h - 44))
+            x = max(0, min(x, screen_w - 240))
+            y = max(0, min(y, screen_h - 40))
         else:
-            x = screen_w - 280
+            x = screen_w - 260
             y = 20
         self.root.geometry(f"+{x}+{y}")
 
@@ -710,7 +768,7 @@ class NetworkOverlay:
 
     def _reset_position(self):
         screen_w = self.root.winfo_screenwidth()
-        self.root.geometry(f"+{screen_w - 280}+20")
+        self.root.geometry(f"+{screen_w - 260}+20")
         self._save_position()
 
     # ── 拖动事件 ─────────────────────────────────
@@ -764,6 +822,7 @@ class NetworkOverlay:
         self.config["font_size"] = size
         self.net_label.configure(font=("Microsoft YaHei UI", size, "bold"))
         save_config(self.config)
+        self._resize_to_content()
 
     def _set_refresh_interval(self, sec):
         self.config["refresh_interval"] = sec
@@ -798,26 +857,34 @@ class NetworkOverlay:
         if self._exiting:
             return
         try:
-            text, is_wifi, ssid = get_network_status()
+            text, is_wifi, ssid, signal = get_network_status()
             if text != self.network_text:
                 self.network_text = text
                 self.net_label.configure(text=text)
 
             # WiFi 分类颜色（始终检查，因分类可能在管理窗口中变更）
+            icon_color = "#a0a0a0"
+            icon_type = "none"
             if is_wifi and ssid:
+                icon_type = "wifi"
                 categories = self.config.setdefault("wifi_categories", {})
                 if ssid not in categories:
                     # 首次连接 → 红色
                     categories[ssid] = "red"
                     save_config(self.config)
                 if categories.get(ssid) == "green":
-                    self.net_label.configure(fg="#00e676")  # 绿色类
+                    icon_color = "#00e676"  # 绿色类
                 else:
-                    self.net_label.configure(fg="#ff5252")  # 红色类
+                    icon_color = "#ff5252"  # 红色类
+                self.net_label.configure(fg=icon_color)
             elif ssid:
+                icon_type = "other"
                 self.net_label.configure(fg="#a0a0a0")  # 有线/其他连接 → 灰色
             else:
                 self.net_label.configure(fg="#ff5252")  # 无网络 → 红色
+
+            draw_signal_icon(self.signal_canvas, icon_type, signal, icon_color)
+            self._resize_to_content()
         except Exception:
             pass  # 静默处理刷新错误，不影响定时器继续
         self._schedule_refresh()
@@ -871,7 +938,7 @@ class NetworkOverlay:
         hint.pack(fill=tk.X)
 
         # ── 当前连接 ──
-        _, _, cur_ssid = get_network_status()
+        _, _, cur_ssid, _ = get_network_status()
         if cur_ssid:
             cur_label = tk.Label(
                 win,
