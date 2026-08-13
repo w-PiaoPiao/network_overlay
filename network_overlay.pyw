@@ -20,8 +20,6 @@ Network Status Overlay — 屏幕网络状态悬浮窗
 import tkinter as tk
 import json
 import os
-import re
-import subprocess
 import sys
 import ctypes
 import ctypes.wintypes
@@ -34,17 +32,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "overlay_config.json")
 LOCK_PATH = os.path.join(SCRIPT_DIR, ".overlay.lock")
 APP_NAME = "NetworkOverlay"
-
-# 隐藏子进程窗口的 creationflags (Python 3.7+)
-try:
-    CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW  # 0x08000000
-except AttributeError:
-    CREATE_NO_WINDOW = 0x08000000
-
-# STARTUPINFO 配合 SW_HIDE 彻底隐藏子进程窗口，防止任务栏图标闪烁
-_startupinfo = subprocess.STARTUPINFO()
-_startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-_startupinfo.wShowWindow = subprocess.SW_HIDE
 
 
 # ── 单实例锁 ──────────────────────────────────────────
@@ -145,7 +132,6 @@ atexit.register(release_lock)
 # ── Windows API 常量和函数 ────────────────────────────
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x00000008
-WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 
@@ -190,129 +176,245 @@ def get_hwnd(tk_root):
     return 0
 
 
-# ── 辅助：解码子进程输出 ──────────────────────────────
-def _decode_output(raw_bytes):
-    """尝试多种编码解码子进程输出（UTF-8 优先，GBK 回退）"""
-    for enc in ("utf-8", "gbk", "gb18030"):
-        try:
-            return raw_bytes.decode(enc)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return raw_bytes.decode("utf-8", errors="replace")
-
-
-# ── 持久化后台网络检测 ────────────────────────────────
-# 使用单个长期存活的 PowerShell 进程，通过管道持续读取网络状态，
-# 避免每次刷新都创建新进程导致任务栏图标闪烁。
-
-_NETWORK_WORKER = None
-_NETWORK_CACHE = ("检测中...", False, None)  # (display_text, is_wifi, ssid)
-_NETWORK_LOCK = threading.Lock()
-_NETWORK_RUNNING = True
-
-_NETWORK_PS_SCRIPT = r'''
-# 强制使用 UTF-8 编码输出，确保中文 SSID 不乱码
-$OutputEncoding = [System.Text.Encoding]::UTF8
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-[Console]::InputEncoding = [System.Text.Encoding]::UTF8
-# 设置控制台代码页为 UTF-8，让 netsh 等外部命令也以 UTF-8 输出
-& chcp 65001 > $null 2>&1
-
-while ($true) {
-    $result = @{Type="none"; Name=""; Signal=0}
-
-    # 1. WiFi (netsh)
-    $netsh = netsh wlan show interfaces 2>$null | Out-String
-    if ($LASTEXITCODE -eq 0) {
-        $ssidMatch = [regex]::Match($netsh, 'SSID\s*:\s*(.+)')
-        $sigMatch = [regex]::Match($netsh, '(\d+)\s*%')
-        if ($ssidMatch.Success) {
-            $ssid = $ssidMatch.Groups[1].Value.Trim()
-        } else { $ssid = $null }
-        if ($sigMatch.Success) {
-            $sig = [int]$sigMatch.Groups[1].Value
-        } else { $sig = 0 }
-        # SSID 非空 且 信号 > 0 → WiFi 已连接
-        if ($ssid -and $sig -gt 0) {
-            $result.Type = "wifi"
-            $result.Name = $ssid
-            $result.Signal = $sig
-        }
-    }
-
-    # 2. Fallback: 其他网络适配器
-    if ($result.Type -eq "none") {
-        try {
-            $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1 -ExpandProperty Name
-            if ($adapter) {
-                $result.Type = "other"
-                $result.Name = $adapter
-            }
-        } catch {}
-    }
-
-    # 3. 最后尝试：默认路由
-    if ($result.Type -eq "none") {
-        try {
-            $iface = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Get-NetIPInterface | Where-Object ConnectionState -eq 'Connected').InterfaceAlias | Select-Object -First 1
-            if ($iface) {
-                $result.Type = "other"
-                $result.Name = $iface
-            }
-        } catch {}
-    }
-
-    $json = ConvertTo-Json -Compress $result
-    Write-Output ("NETJSON:" + $json)
-    Start-Sleep -Seconds 3
-}
-'''
-
-
-def _start_network_worker():
-    """启动持久化 PowerShell 后台进程，在独立线程中读取输出并缓存结果。"""
-    global _NETWORK_WORKER
+def _enable_dpi_awareness():
+    """启用进程级 DPI 感知，使 winfo_screenwidth/height 返回真实像素"""
     try:
-        _NETWORK_WORKER = subprocess.Popen(
-            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
-             "-Command", _NETWORK_PS_SCRIPT],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW,
-            startupinfo=_startupinfo,
-        )
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
-        _NETWORK_WORKER = None
-        return
-
-    def _reader():
-        global _NETWORK_CACHE, _NETWORK_RUNNING, _NETWORK_WORKER
         try:
-            for line in iter(_NETWORK_WORKER.stdout.readline, b''):
-                if not _NETWORK_RUNNING:
-                    break
-                try:
-                    decoded = _decode_output(line).strip()
-                    if decoded.startswith("NETJSON:"):
-                        data = json.loads(decoded[8:])
-                        display_text, is_wifi, ssid = _parse_network_data(data)
-                        with _NETWORK_LOCK:
-                            _NETWORK_CACHE = (display_text, is_wifi, ssid)
-                except Exception:
-                    continue
+            ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
-        finally:
-            # worker 进程意外退出时标记为 None，下次刷新会自动重启
-            _NETWORK_WORKER = None
 
-    t = threading.Thread(target=_reader, daemon=True)
-    t.start()
+
+# ── 原生 Win32 网络检测 ──────────────────────────────
+# 使用 wlanapi.dll + iphlpapi.dll 直接查询，无需 PowerShell 子进程。
+
+WLAN_MAX_NAME_LENGTH = 256
+_wlan_intf_opcode_current_connection = 7
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _WLAN_INTERFACE_INFO(ctypes.Structure):
+    _fields_ = [
+        ("InterfaceGuid", _GUID),
+        ("strInterfaceDescription", ctypes.c_wchar * WLAN_MAX_NAME_LENGTH),
+        ("isState", ctypes.c_int),
+    ]
+
+
+class _WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+    _fields_ = [
+        ("dwNumberOfItems", ctypes.c_ulong),
+        ("dwIndex", ctypes.c_ulong),
+        ("InterfaceInfo", _WLAN_INTERFACE_INFO * 1),
+    ]
+
+
+class _DOT11_SSID(ctypes.Structure):
+    _fields_ = [
+        ("uSSIDLength", ctypes.c_ulong),
+        ("ucSSID", ctypes.c_ubyte * 32),
+    ]
+
+
+class _DOT11_MAC_ADDRESS(ctypes.Structure):
+    _fields_ = [("ucOctet", ctypes.c_ubyte * 6)]
+
+
+class _WLAN_ASSOCIATION_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("dot11Ssid", _DOT11_SSID),
+        ("dot11BssType", ctypes.c_int),
+        ("dot11Bssid", _DOT11_MAC_ADDRESS),
+        ("dot11PhyType", ctypes.c_int),
+        ("uDot11PhyIndex", ctypes.c_ulong),
+        ("wlanSignalQuality", ctypes.c_ulong),
+        ("ulRxRate", ctypes.c_ulong),
+        ("ulTxRate", ctypes.c_ulong),
+    ]
+
+
+class _WLAN_SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("bSecurityEnabled", ctypes.c_int),
+        ("bOneXEnabled", ctypes.c_int),
+        ("dot11AuthAlgorithm", ctypes.c_int),
+        ("dot11CipherAlgorithm", ctypes.c_int),
+    ]
+
+
+class _WLAN_CONNECTION_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("isState", ctypes.c_int),
+        ("wlanConnectionMode", ctypes.c_int),
+        ("strProfileName", ctypes.c_wchar * WLAN_MAX_NAME_LENGTH),
+        ("wlanAssociationAttributes", _WLAN_ASSOCIATION_ATTRIBUTES),
+        ("wlanSecurityAttributes", _WLAN_SECURITY_ATTRIBUTES),
+    ]
+
+
+class _IP_ADAPTER_ADDRESSES(ctypes.Structure):
+    pass
+
+
+_IP_ADAPTER_ADDRESSES._fields_ = [
+    ("Length", ctypes.c_ulong),
+    ("IfIndex", ctypes.c_ulong),
+    ("Next", ctypes.POINTER(_IP_ADAPTER_ADDRESSES)),
+    ("AdapterName", ctypes.c_char_p),
+    ("FirstUnicastAddress", ctypes.c_void_p),
+    ("FirstAnycastAddress", ctypes.c_void_p),
+    ("FirstMulticastAddress", ctypes.c_void_p),
+    ("FirstDnsServerAddress", ctypes.c_void_p),
+    ("DnsSuffix", ctypes.c_wchar_p),
+    ("Description", ctypes.c_wchar_p),
+    ("FriendlyName", ctypes.c_wchar_p),
+    ("PhysicalAddress", ctypes.c_ubyte * 8),
+    ("PhysicalAddressLength", ctypes.c_ulong),
+    ("Flags", ctypes.c_ulong),
+    ("Mtu", ctypes.c_ulong),
+    ("IfType", ctypes.c_ulong),
+    ("OperStatus", ctypes.c_int),
+]
+
+
+_wlanapi = ctypes.windll.wlanapi
+_iphlpapi = ctypes.windll.iphlpapi
+
+_WlanOpenHandle = _wlanapi.WlanOpenHandle
+_WlanEnumInterfaces = _wlanapi.WlanEnumInterfaces
+_WlanQueryInterface = _wlanapi.WlanQueryInterface
+_WlanFreeMemory = _wlanapi.WlanFreeMemory
+_WlanCloseHandle = _wlanapi.WlanCloseHandle
+_GetAdaptersAddresses = _iphlpapi.GetAdaptersAddresses
+
+
+def _query_wifi():
+    """通过 WLAN API 查询当前 WiFi 连接，返回 (ssid, signal) 或 (None, 0)"""
+    handle = ctypes.c_void_p()
+    negotiated = ctypes.c_ulong()
+    if _WlanOpenHandle(2, None, ctypes.byref(negotiated), ctypes.byref(handle)) != 0:
+        return None, 0
+    try:
+        iflist = ctypes.POINTER(_WLAN_INTERFACE_INFO_LIST)()
+        if _WlanEnumInterfaces(handle, None, ctypes.byref(iflist)) != 0 or not iflist:
+            return None, 0
+        try:
+            if iflist.contents.dwNumberOfItems == 0:
+                return None, 0
+            guid = iflist.contents.InterfaceInfo[0].InterfaceGuid
+            data = ctypes.c_void_p()
+            data_size = ctypes.c_ulong()
+            ret = _WlanQueryInterface(
+                handle, ctypes.byref(guid), _wlan_intf_opcode_current_connection,
+                None, ctypes.byref(data_size), ctypes.byref(data), None)
+            if ret != 0 or not data:
+                return None, 0
+            try:
+                conn = ctypes.cast(data, ctypes.POINTER(_WLAN_CONNECTION_ATTRIBUTES)).contents
+                assoc = conn.wlanAssociationAttributes
+                ssid_len = int(assoc.dot11Ssid.uSSIDLength)
+                if ssid_len <= 0:
+                    return None, 0
+                ssid_bytes = bytes(assoc.dot11Ssid.ucSSID[:ssid_len])
+                ssid = ssid_bytes.decode("utf-8", errors="replace")
+                return ssid, int(assoc.wlanSignalQuality)
+            finally:
+                _WlanFreeMemory(data)
+        finally:
+            _WlanFreeMemory(ctypes.cast(iflist, ctypes.c_void_p))
+    finally:
+        _WlanCloseHandle(handle, None)
+
+
+def _query_other_adapter():
+    """通过 GetAdaptersAddresses 查询状态为 Up 的非 WiFi 适配器名称"""
+    size = ctypes.c_ulong(0)
+    _GetAdaptersAddresses(0, 0, None, None, ctypes.byref(size))
+    if size.value == 0:
+        return None
+    buf = ctypes.create_string_buffer(size.value)
+    ptr = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
+    if _GetAdaptersAddresses(0, 0, None, ptr, ctypes.byref(size)) != 0:
+        return None
+    cur = ptr
+    while cur:
+        addr = cur.contents
+        if addr.OperStatus == 1 and addr.IfType != 24:  # Up 且非 loopback
+            name = addr.FriendlyName
+            if name:
+                return name
+        cur = addr.Next
+    return None
+
+
+def _query_network():
+    """查询网络状态，返回 dict: {Type, Name, Signal}"""
+    ssid, signal = _query_wifi()
+    if ssid:
+        return {"Type": "wifi", "Name": ssid, "Signal": signal}
+    name = _query_other_adapter()
+    if name:
+        return {"Type": "other", "Name": name, "Signal": 0}
+    return {"Type": "none", "Name": "", "Signal": 0}
+
+
+# ── 后台采样线程 ──────────────────────────────────────
+_NET_CACHE = ("检测中...", False, None)  # (display_text, is_wifi, ssid)
+_NET_LOCK = threading.Lock()
+_NET_STOP = threading.Event()
+_NET_THREAD = None
+_NET_INTERVAL = 5
+_NET_INTERVAL_LOCK = threading.Lock()
+
+
+def _sampler_loop():
+    """后台线程：周期查询网络状态并更新缓存"""
+    global _NET_CACHE
+    while not _NET_STOP.is_set():
+        try:
+            data = _query_network()
+            display_text, is_wifi, ssid = _parse_network_data(data)
+        except Exception:
+            display_text, is_wifi, ssid = ("❌ 无网络连接", False, None)
+        with _NET_LOCK:
+            _NET_CACHE = (display_text, is_wifi, ssid)
+        _NET_STOP.wait(_get_sampling_interval())
+
+
+def _ensure_sampler():
+    """确保采样线程已启动"""
+    global _NET_THREAD
+    if _NET_THREAD is not None and _NET_THREAD.is_alive():
+        return
+    _NET_STOP.clear()
+    _NET_THREAD = threading.Thread(target=_sampler_loop, daemon=True)
+    _NET_THREAD.start()
+
+
+def _set_sampling_interval(sec):
+    """更新后台采样线程的间隔（秒）"""
+    global _NET_INTERVAL
+    with _NET_INTERVAL_LOCK:
+        _NET_INTERVAL = sec
+
+
+def _get_sampling_interval():
+    with _NET_INTERVAL_LOCK:
+        return _NET_INTERVAL
 
 
 def _parse_network_data(data):
-    """将 PowerShell 返回的 JSON 数据解析为 (display_text, is_wifi, ssid)。"""
+    """将查询结果解析为 (display_text, is_wifi, ssid)。"""
     net_type = data.get("Type", "none")
     name = data.get("Name", "")
     signal = data.get("Signal", 0)
@@ -343,26 +445,15 @@ def _parse_network_data(data):
 
 
 def get_network_status():
-    """
-    获取缓存的网络状态。不再每次创建子进程，只读取后台 worker 的最新结果。
-    如果 worker 未启动或已退出，自动重启。
-    """
-    global _NETWORK_WORKER
-    if _NETWORK_WORKER is None or _NETWORK_WORKER.poll() is not None:
-        _start_network_worker()
-    with _NETWORK_LOCK:
-        return _NETWORK_CACHE
+    """获取缓存的网络状态。若采样线程未启动则启动。"""
+    _ensure_sampler()
+    with _NET_LOCK:
+        return _NET_CACHE
 
 
 def _stop_network_worker():
-    """停止后台网络检测进程。"""
-    global _NETWORK_RUNNING, _NETWORK_WORKER
-    _NETWORK_RUNNING = False
-    try:
-        if _NETWORK_WORKER and _NETWORK_WORKER.poll() is None:
-            _NETWORK_WORKER.terminate()
-    except Exception:
-        pass
+    """停止后台采样线程"""
+    _NET_STOP.set()
 
 
 atexit.register(_stop_network_worker)
@@ -459,6 +550,7 @@ class NetworkOverlay:
             save_config(self.config)
         self._exiting = False
         self._mgmt_window = None  # WiFi 管理窗口引用
+        self._refresh_job = None  # 当前刷新定时器 id（防止定时器叠加）
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -486,7 +578,6 @@ class NetworkOverlay:
         self.root.deiconify()
 
         if self.config["locked"]:
-            self._set_click_through(True)
             self.lock_btn_text.set(lock_icon(True))
             self.lock_btn.configure(fg="#e94560")
 
@@ -552,9 +643,10 @@ class NetworkOverlay:
         self.context_menu.add_command(label="🔄 手动刷新", command=self._refresh_network)
         self.context_menu.add_command(label="📋 管理 WiFi 分类", command=self._open_wifi_manager)
         self.context_menu.add_command(
-            label="☑ 开机自动启动" if self.config.get("auto_start") else "☐ 开机自动启动",
+            label=self._auto_start_label(),
             command=self._toggle_auto_start
         )
+        self._auto_start_index = self.context_menu.index("end")
         self.context_menu.add_separator()
         self.context_menu.add_command(label="📍 重置位置到右上角", command=self._reset_position)
         self.context_menu.add_separator()
@@ -570,8 +662,8 @@ class NetworkOverlay:
         for widget in [self.inner_frame, self.net_label, self.lock_btn]:
             widget.bind("<Button-3>", self._show_context_menu)
 
-        self.lock_btn.bind("<Button-1>", lambda e: self._toggle_lock())
-        self.close_btn.bind("<Button-1>", lambda e: self._quit())
+        self.lock_btn.bind("<Button-1>", lambda e: None if self.config["locked"] else self._toggle_lock())
+        self.close_btn.bind("<Button-1>", lambda e: None if self.config["locked"] else self._quit())
 
         self.inner_frame.bind("<MouseWheel>", self._on_scroll)
         self.net_label.bind("<MouseWheel>", self._on_scroll)
@@ -594,32 +686,15 @@ class NetworkOverlay:
         except Exception:
             pass
 
-    def _set_click_through(self, enable):
-        """设置鼠标穿透（点击直达下层窗口）"""
-        self.root.update_idletasks()
-        hwnd = get_hwnd(self.root)
-        if not hwnd:
-            return
-        try:
-            ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
-            if enable:
-                new_style = ex_style | WS_EX_TRANSPARENT
-            else:
-                new_style = ex_style & ~WS_EX_TRANSPARENT
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style)
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
-        except Exception:
-            pass
-
     # ── 位置 ──────────────────────────────────────
     def _set_initial_position(self):
         screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
         x = self.config.get("x")
         y = self.config.get("y")
         if x is not None and y is not None:
             x = max(0, min(x, screen_w - 260))
-            y = max(0, min(y, 200))
+            y = max(0, min(y, screen_h - 44))
         else:
             x = screen_w - 280
             y = 20
@@ -675,10 +750,8 @@ class NetworkOverlay:
         self.config["locked"] = not self.config["locked"]
         self.lock_btn_text.set(lock_icon(self.config["locked"]))
         if self.config["locked"]:
-            self._set_click_through(True)
             self.lock_btn.configure(fg="#e94560")
         else:
-            self._set_click_through(False)
             self.lock_btn.configure(fg="#a0a0a0")
         save_config(self.config)
 
@@ -695,6 +768,22 @@ class NetworkOverlay:
     def _set_refresh_interval(self, sec):
         self.config["refresh_interval"] = sec
         save_config(self.config)
+        _set_sampling_interval(sec)
+        self._schedule_refresh()
+
+    def _schedule_refresh(self):
+        """取消旧的刷新定时器并注册新的，避免定时器叠加"""
+        if self._refresh_job is not None:
+            try:
+                self.root.after_cancel(self._refresh_job)
+            except Exception:
+                pass
+            self._refresh_job = None
+        interval_ms = self.config.get("refresh_interval", 5) * 1000
+        self._refresh_job = self.root.after(interval_ms, self._refresh_network)
+
+    def _auto_start_label(self):
+        return "☑ 开机自动启动" if self.config.get("auto_start") else "☐ 开机自动启动"
 
     def _toggle_auto_start(self):
         """切换开机自启状态"""
@@ -702,7 +791,7 @@ class NetworkOverlay:
         set_auto_start(new_state)
         self.config["auto_start"] = new_state
         save_config(self.config)
-        self._build_context_menu()  # 重建菜单以更新 ☐/☑ 标识
+        self.context_menu.entryconfigure(self._auto_start_index, label=self._auto_start_label())
 
     def _refresh_network(self):
         """刷新网络状态显示"""
@@ -725,12 +814,13 @@ class NetworkOverlay:
                     self.net_label.configure(fg="#00e676")  # 绿色类
                 else:
                     self.net_label.configure(fg="#ff5252")  # 红色类
+            elif ssid:
+                self.net_label.configure(fg="#a0a0a0")  # 有线/其他连接 → 灰色
             else:
-                self.net_label.configure(fg="#ff5252")  # 非 WiFi → 红色
+                self.net_label.configure(fg="#ff5252")  # 无网络 → 红色
         except Exception:
             pass  # 静默处理刷新错误，不影响定时器继续
-        interval_ms = self.config.get("refresh_interval", 5) * 1000
-        self.root.after(interval_ms, self._refresh_network)
+        self._schedule_refresh()
 
     # ── WiFi 分类管理 ──────────────────────────
     def _open_wifi_manager(self):
@@ -832,18 +922,34 @@ class NetworkOverlay:
             save_config(self.config)
             self._refresh_network()
 
-        # 按字母排序显示
-        sorted_ssids = sorted(categories.keys(), key=str.lower)
-        if not sorted_ssids:
-            empty_label = tk.Label(
-                list_frame,
-                text="暂无连接记录\n连接 WiFi 后会自动出现在这里",
-                font=("Microsoft YaHei UI", 10),
-                fg="#666", bg="#16213e", pady=20,
-                justify=tk.CENTER,
-            )
-            empty_label.pack(fill=tk.X)
-        else:
+        def _delete_ssid(ssid):
+            """从分类记录中删除该 SSID 并重建列表"""
+            if ssid in categories:
+                del categories[ssid]
+            save_config(self.config)
+            self._refresh_network()
+            _rebuild_list()
+
+        def _rebuild_list():
+            """清空并重建 SSID 列表（用于删除后刷新）"""
+            for w in list_frame.winfo_children():
+                w.destroy()
+            ssid_vars.clear()
+            _populate_list()
+
+        def _populate_list():
+            # 按字母排序显示
+            sorted_ssids = sorted(categories.keys(), key=str.lower)
+            if not sorted_ssids:
+                empty_label = tk.Label(
+                    list_frame,
+                    text="暂无连接记录\n连接 WiFi 后会自动出现在这里",
+                    font=("Microsoft YaHei UI", 10),
+                    fg="#666", bg="#16213e", pady=20,
+                    justify=tk.CENTER,
+                )
+                empty_label.pack(fill=tk.X)
+                return
             for ssid in sorted_ssids:
                 is_green = categories.get(ssid) == "green"
                 var = tk.BooleanVar(value=is_green)
@@ -871,6 +977,19 @@ class NetworkOverlay:
                 )
                 cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+                # 删除按钮
+                del_btn = tk.Label(
+                    row,
+                    text="🗑",
+                    font=("Segoe UI Symbol", 9),
+                    fg="#888", bg="#16213e",
+                    padx=4, cursor="hand2",
+                )
+                del_btn.pack(side=tk.RIGHT)
+                del_btn.bind("<Button-1>", lambda e, s=ssid: _delete_ssid(s))
+                del_btn.bind("<Enter>", lambda e, b=del_btn: b.configure(fg="#e94560"))
+                del_btn.bind("<Leave>", lambda e, b=del_btn: b.configure(fg="#888"))
+
                 # 当前连接标记
                 if is_current:
                     dot = tk.Label(
@@ -881,6 +1000,8 @@ class NetworkOverlay:
                         padx=4,
                     )
                     dot.pack(side=tk.RIGHT)
+
+        _populate_list()
 
         # ── 底部按钮 ──
         btn_frame = tk.Frame(win, bg="#1a1a2e", pady=10)
@@ -918,8 +1039,6 @@ class NetworkOverlay:
             self.root.destroy()
         except Exception:
             pass
-        # 使用 os._exit 确保进程完全终止，不会卡住
-        os._exit(0)
 
     def run(self):
         self.root.mainloop()
@@ -940,5 +1059,6 @@ if __name__ == "__main__":
             pass
         sys.exit(0)
 
+    _enable_dpi_awareness()
     app = NetworkOverlay()
     app.run()
