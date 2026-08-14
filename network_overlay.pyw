@@ -373,7 +373,7 @@ _NET_CACHE = ("检测中...", False, None, 0)  # (display_text, is_wifi, ssid, s
 _NET_LOCK = threading.Lock()
 _NET_STOP = threading.Event()
 _NET_THREAD = None
-_NET_INTERVAL = 5
+_NET_INTERVAL = 1
 _NET_INTERVAL_LOCK = threading.Lock()
 
 
@@ -451,7 +451,7 @@ def load_config():
         "locked": False,
         "opacity": 0.75,
         "font_size": 9,
-        "refresh_interval": 5,
+        "refresh_interval": 1,
         "auto_start": False,
         "wifi_categories": {},  # SSID → "green" | "red"，新 WiFi 默认 "red"
     }
@@ -681,7 +681,7 @@ class NetworkOverlay:
         self.context_menu.add_cascade(label="🔤 字号", menu=font_menu)
 
         refresh_menu = tk.Menu(self.context_menu, tearoff=0, font=("Microsoft YaHei UI", 9))
-        for sec in [3, 5, 10, 15, 30]:
+        for sec in [1, 2, 3, 5, 10]:
             refresh_menu.add_command(label=f"{sec} 秒",
                                      command=lambda s=sec: self._set_refresh_interval(s))
         self.context_menu.add_cascade(label="⏱ 刷新间隔", menu=refresh_menu)
