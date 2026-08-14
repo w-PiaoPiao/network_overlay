@@ -2,7 +2,8 @@
 """
 Network Status Overlay — 屏幕网络状态悬浮窗
   - 优先显示 WiFi SSID，无 WiFi 时显示以太网/其他连接状态
-  - 解锁后可拖动，锁定后鼠标穿透（不干扰游戏 / 全屏应用）
+  - 解锁后可拖动，锁定后真正的鼠标穿透（不干扰游戏 / 全屏应用）
+  - 系统托盘图标：左键切换锁定，右键弹出菜单（锁定穿透后的操作入口）
   - 右键菜单切换锁定/解锁、透明度、字号、刷新间隔
   - 位置和状态自动保存到同目录 overlay_config.json
   - 滚轮调整透明度
@@ -13,11 +14,12 @@ Network Status Overlay — 屏幕网络状态悬浮窗
   - 或运行 启动悬浮窗.bat / 启动悬浮窗(静默).vbs
   - 右键悬浮窗打开设置菜单
   - 解锁状态（🔓）：左键拖动移动位置
-  - 锁定状态（🔒）：鼠标穿透，不干扰下层应用
+  - 锁定状态（🔒）：鼠标穿透，请通过系统托盘图标操作
   - 在任务管理器中显示为 "NetworkOverlay" 进程
 """
 
 import tkinter as tk
+import tkinter.font as tkfont
 import json
 import os
 import sys
@@ -131,9 +133,12 @@ atexit.register(release_lock)
 
 # ── Windows API 常量和函数 ────────────────────────────
 GWL_EXSTYLE = -20
+GWLP_WNDPROC = -4
 WS_EX_TOPMOST = 0x00000008
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_LAYERED = 0x00080000
 WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TRANSPARENT = 0x00000020
 
 user32 = ctypes.windll.user32
 
@@ -157,6 +162,42 @@ SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
+SWP_FRAMECHANGED = 0x0020
+
+# ── 64 位函数签名（防止 ctypes 默认 c_int 截断指针/句柄/地址）────────
+CallWindowProcW = user32.CallWindowProcW
+CallWindowProcW.argtypes = [ctypes.c_void_p, ctypes.wintypes.HWND,
+                            ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+CallWindowProcW.restype = ctypes.c_longlong
+
+user32.GetDC.restype = ctypes.c_void_p
+user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+user32.CreateIconIndirect.argtypes = [ctypes.c_void_p]
+user32.CreateIconIndirect.restype = ctypes.c_void_p
+user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+user32.GetCursorPos.argtypes = [ctypes.c_void_p]
+user32.SetForegroundWindow.argtypes = [ctypes.wintypes.HWND]
+user32.PostMessageW.argtypes = [ctypes.wintypes.HWND, ctypes.c_uint,
+                                ctypes.c_size_t, ctypes.c_ssize_t]
+
+_gdi32 = ctypes.windll.gdi32
+_gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+_gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+_gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+_gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+_gdi32.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int,
+                                ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
+_gdi32.CreateBitmap.restype = ctypes.c_void_p
+_gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_gdi32.SelectObject.restype = ctypes.c_void_p
+_gdi32.CreateSolidBrush.argtypes = [ctypes.c_ulong]
+_gdi32.CreateSolidBrush.restype = ctypes.c_void_p
+_gdi32.Rectangle.argtypes = [ctypes.c_void_p,
+                             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+_gdi32.Ellipse.argtypes = [ctypes.c_void_p,
+                           ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+_gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+_gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
 
 
 def get_hwnd(tk_root):
@@ -473,6 +514,24 @@ def save_config(cfg):
         pass
 
 
+# ── 颜色主题 ──────────────────────────────────────────
+COLOR_BG = "#1a1a2e"           # 悬浮窗外层背景
+COLOR_INNER_BG = "#16213e"     # 内框背景
+COLOR_BORDER = "#0f3460"       # 内框边框
+COLOR_BORDER_DRAG = "#73c2fb"  # 拖动时边框高亮
+COLOR_TEXT = "#e0e0e0"         # 主文字
+COLOR_TEXT_DIM = "#a0a0a0"     # 次要文字 / 按钮
+COLOR_DISABLED = "#555555"     # 禁用状态
+COLOR_GREEN = "#00e676"        # 绿色类 WiFi
+COLOR_RED = "#ff5252"          # 红色类 WiFi / 错误图标
+COLOR_LOCKED = "#e94560"       # 已锁定指示 / 悬停警示
+COLOR_NONE_TEXT = "#888888"    # 无网络文字（错误信号由红色图标承担）
+MAX_TEXT_WIDTH = 220           # 悬浮窗文本最大像素宽度（超出截断）
+
+# emoji 一律使用 Segoe UI Emoji，避免 Segoe UI Symbol 渲染为单色/缺字形
+EMOJI_FONT = "Segoe UI Emoji"
+
+
 def lock_icon(locked):
     return "🔒" if locked else "🔓"
 
@@ -495,14 +554,16 @@ def _signal_level(signal):
 
 
 def draw_signal_icon(canvas, icon_type, signal, color):
-    """在 Canvas 上绘制小图标。icon_type: "wifi" | "other" | "none" """
+    """在 Canvas 上绘制小图标。icon_type: "wifi" | "other" | "none"
+    图标元素以 20px 高度为基准随 canvas 尺寸等比缩放。"""
     canvas.delete("all")
     w = int(canvas["width"])
     h = int(canvas["height"])
+    scale = min(w, h) / 20.0
 
     if icon_type == "wifi":
-        cx, cy = w / 2, h - 2.5          # 扇形圆心在底部中点
-        radii = [2.8, 4.9, 7.0, 9.1]     # 4 段弧半径递增
+        cx, cy = w / 2, h - 2.5 * scale            # 扇形圆心在底部中点
+        radii = [r * scale for r in (2.8, 4.9, 7.0, 9.1)]  # 4 段弧半径递增
         lit = _signal_level(signal)
         for i, r in enumerate(radii):
             if r > min(w, h) / 2 + 1:
@@ -513,8 +574,9 @@ def draw_signal_icon(canvas, icon_type, signal, color):
                 start=45, extent=90, style=tk.ARC,
                 outline=arc_color, width=2.0,
             )
+        dot = 1.5 * scale
         canvas.create_oval(
-            cx - 1.5, cy - 1.5, cx + 1.5, cy + 1.5,
+            cx - dot, cy - dot, cx + dot, cy + dot,
             fill=color, outline=color,
         )
     elif icon_type == "other":
@@ -580,6 +642,160 @@ def is_auto_start_enabled():
         return False
 
 
+# ── 悬停提示气泡 ──────────────────────────────────────
+class _Tooltip:
+    """轻量悬停提示：悬停 500ms 后在悬浮窗下方弹出，移开/点击后消失"""
+
+    def __init__(self, root, get_text):
+        self._root = root
+        self._get_text = get_text
+        self._win = None
+        self._job = None
+
+    def schedule(self, _event=None):
+        self.cancel()
+        self._job = self._root.after(500, self.show)
+
+    def cancel(self, _event=None):
+        if self._job is not None:
+            try:
+                self._root.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+        self.hide()
+
+    def show(self):
+        self._job = None
+        if self._win is not None:
+            return
+        text = self._get_text()
+        if not text:
+            return
+        try:
+            win = tk.Toplevel(self._root)
+            self._win = win
+            win.overrideredirect(True)
+            win.wm_attributes("-topmost", 1)
+            win.configure(bg=COLOR_BORDER)
+            tk.Label(
+                win, text=text, justify=tk.LEFT,
+                font=("Microsoft YaHei UI", 9),
+                fg=COLOR_TEXT, bg=COLOR_INNER_BG,
+                padx=8, pady=4,
+            ).pack()
+            x = self._root.winfo_x()
+            y = self._root.winfo_y() + self._root.winfo_height() + 6
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            self._win = None
+
+    def hide(self):
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except Exception:
+                pass
+            self._win = None
+
+
+# ── 系统托盘（纯 ctypes，零第三方依赖）──────────────────
+NIM_ADD = 0x00000000
+NIM_MODIFY = 0x00000001
+NIM_DELETE = 0x00000002
+NIM_SETVERSION = 0x00000004
+NIF_MESSAGE = 0x00000001
+NIF_ICON = 0x00000002
+NIF_TIP = 0x00000004
+WM_TRAYICON = 0x0401  # WM_USER + 1，托盘回调消息
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONUP = 0x0205
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("hWnd", ctypes.wintypes.HWND),
+        ("uID", ctypes.c_uint),
+        ("uFlags", ctypes.c_uint),
+        ("uCallbackMessage", ctypes.c_uint),
+        ("hIcon", ctypes.wintypes.HICON),
+        ("szTip", ctypes.c_wchar * 128),
+        ("dwState", ctypes.c_ulong),
+        ("dwStateMask", ctypes.c_ulong),
+        ("szInfo", ctypes.c_wchar * 256),
+        ("uVersion", ctypes.c_uint),
+        ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", ctypes.c_ulong),
+        ("guidItem", _GUID),
+    ]
+
+
+class _ICONINFO(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", ctypes.c_int),
+        ("xHotspot", ctypes.c_ulong),
+        ("yHotspot", ctypes.c_ulong),
+        ("hbmMask", ctypes.c_void_p),
+        ("hbmColor", ctypes.c_void_p),
+    ]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+_WNDPROCTYPE = ctypes.WINFUNCTYPE(
+    ctypes.c_longlong, ctypes.wintypes.HWND, ctypes.c_uint,
+    ctypes.c_size_t, ctypes.c_ssize_t)
+
+
+def _make_dot_icon(rgb):
+    """生成指定 RGB 颜色的圆形托盘图标（圆外透明），返回 HICON；失败返回 None"""
+    gdi32 = _gdi32
+    u32 = user32
+    try:
+        size = u32.GetSystemMetrics(49) or 16  # SM_CXSMICON
+        screen_dc = u32.GetDC(None)
+
+        # 彩色位图：黑底 + 彩色圆
+        color_dc = gdi32.CreateCompatibleDC(screen_dc)
+        color_bm = gdi32.CreateCompatibleBitmap(screen_dc, size, size)
+        old_color = gdi32.SelectObject(color_dc, color_bm)
+        black = gdi32.CreateSolidBrush(0x00000000)
+        color_brush = gdi32.CreateSolidBrush(rgb)
+        gdi32.SelectObject(color_dc, black)
+        gdi32.Rectangle(color_dc, 0, 0, size, size)
+        gdi32.SelectObject(color_dc, color_brush)
+        gdi32.Ellipse(color_dc, 1, 1, size - 1, size - 1)
+
+        # 掩码位图（单色）：1=透明，0=不透明 → 白底 + 黑圆
+        mask_dc = gdi32.CreateCompatibleDC(screen_dc)
+        mask_bm = gdi32.CreateBitmap(size, size, 1, 1, None)
+        old_mask = gdi32.SelectObject(mask_dc, mask_bm)
+        white = gdi32.CreateSolidBrush(0x00FFFFFF)
+        gdi32.SelectObject(mask_dc, white)
+        gdi32.Rectangle(mask_dc, 0, 0, size, size)
+        gdi32.SelectObject(mask_dc, black)
+        gdi32.Ellipse(mask_dc, 1, 1, size - 1, size - 1)
+
+        info = _ICONINFO(1, 0, 0, mask_bm, color_bm)
+        hicon = u32.CreateIconIndirect(ctypes.byref(info))
+
+        # 清理 GDI 资源（ICON 创建后位图即可释放）
+        gdi32.SelectObject(color_dc, old_color)
+        gdi32.SelectObject(mask_dc, old_mask)
+        for obj in (black, color_brush, white, color_bm, mask_bm):
+            if obj:
+                gdi32.DeleteObject(obj)
+        gdi32.DeleteDC(color_dc)
+        gdi32.DeleteDC(mask_dc)
+        u32.ReleaseDC(None, screen_dc)
+        return hicon or None
+    except Exception:
+        return None
+
+
 # ── 主窗口类 ──────────────────────────────────────────
 class NetworkOverlay:
     def __init__(self):
@@ -592,6 +808,8 @@ class NetworkOverlay:
         self._exiting = False
         self._mgmt_window = None  # WiFi 管理窗口引用
         self._refresh_job = None  # 当前刷新定时器 id（防止定时器叠加）
+        self._first_run = self.config.get("x") is None  # 首次运行（无位置记录）
+        self._last_status = ("检测中...", False, None, 0)  # 最近一次网络状态
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -600,12 +818,15 @@ class NetworkOverlay:
         self.root.geometry("1x28")
 
         # 使用纯色背景（不再用 transparentcolor，避免与扩展样式冲突）
-        self.bg_color = "#1a1a2e"
-        self.inner_bg = "#16213e"
+        self.bg_color = COLOR_BG
+        self.inner_bg = COLOR_INNER_BG
         self.root.configure(bg=self.bg_color)
         self.root.wm_attributes("-topmost", 1)
         self.root.wm_attributes("-alpha", self.config["opacity"])
 
+        self._text_font = tkfont.Font(
+            family="Microsoft YaHei UI",
+            size=self.config["font_size"], weight="bold")
         self._drag_data = {"x": 0, "y": 0, "dragging": False}
         self.network_text = ""
 
@@ -614,36 +835,57 @@ class NetworkOverlay:
         self._build_context_menu()
         self._bind_events()
         self._apply_window_ex_styles()
+        self._setup_tray()
 
         self._refresh_network()
         self.root.deiconify()
 
+        self._sync_lock_visuals()
         if self.config["locked"]:
-            self.lock_btn_text.set(lock_icon(True))
-            self.lock_btn.configure(fg="#e94560")
+            self._set_click_through(True)
+
+        if self._first_run:
+            self.root.after(300, self._show_first_run_hint)
 
     # ── UI 构建 ──────────────────────────────────
+    def _icon_dims(self):
+        """信号图标尺寸随字号缩放（9px 字号时约 22x20）"""
+        size = self.config["font_size"]
+        return size * 2 + 4, size * 2 + 2
+
+    def _truncate_text(self, text):
+        """按像素宽度截断过长文本，超出部分以 … 收尾，避免窗口宽度失控"""
+        try:
+            if self._text_font.measure(text) <= MAX_TEXT_WIDTH:
+                return text
+            while text and self._text_font.measure(text + "…") > MAX_TEXT_WIDTH:
+                text = text[:-1]
+            return text + "…" if text else text
+        except Exception:
+            return text
+
     def _build_ui(self):
         self.main_frame = tk.Frame(self.root, bg=self.bg_color, highlightthickness=0, bd=0)
         self.main_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
         self.inner_frame = tk.Frame(
             self.main_frame, bg=self.inner_bg,
-            highlightthickness=1, highlightbackground="#0f3460",
-            highlightcolor="#0f3460", bd=0,
+            highlightthickness=1, highlightbackground=COLOR_BORDER,
+            highlightcolor=COLOR_BORDER, bd=0,
         )
         self.inner_frame.pack(fill=tk.BOTH, expand=True)
 
+        icon_w, icon_h = self._icon_dims()
         self.signal_canvas = tk.Canvas(
-            self.inner_frame, width=22, height=20,
+            self.inner_frame, width=icon_w, height=icon_h,
             bg=self.inner_bg, highlightthickness=0, bd=0,
         )
         self.signal_canvas.pack(side=tk.LEFT, padx=(5, 1), pady=1)
 
         self.net_label = tk.Label(
             self.inner_frame, text="检测中...",
-            fg="#e0e0e0", bg=self.inner_bg,
-            font=("Microsoft YaHei UI", self.config["font_size"], "bold"),
+            fg=COLOR_TEXT, bg=self.inner_bg,
+            font=self._text_font,
             anchor="w", padx=4, pady=1,
         )
         self.net_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -651,66 +893,93 @@ class NetworkOverlay:
         self.lock_btn_text = tk.StringVar(value=lock_icon(self.config["locked"]))
         self.lock_btn = tk.Label(
             self.inner_frame, textvariable=self.lock_btn_text,
-            fg="#a0a0a0", bg=self.inner_bg,
-            font=("Segoe UI Symbol", 10), padx=4, pady=1, cursor="hand2",
+            fg=COLOR_TEXT_DIM, bg=self.inner_bg,
+            font=(EMOJI_FONT, 9), padx=4, pady=1, cursor="hand2",
         )
         self.lock_btn.pack(side=tk.RIGHT)
 
         self.close_btn = tk.Label(
             self.inner_frame, text="✕",
-            fg="#a0a0a0", bg=self.inner_bg,
+            fg=COLOR_TEXT_DIM, bg=self.inner_bg,
             font=("Segoe UI Symbol", 9), padx=3, pady=1, cursor="hand2",
         )
-        self.close_btn.pack(side=tk.RIGHT)
+        self.close_btn.pack(side=tk.RIGHT, padx=(6, 2))
 
     def _build_context_menu(self):
-        self.context_menu = tk.Menu(self.root, tearoff=0, font=("Microsoft YaHei UI", 9))
+        menu_font = ("Microsoft YaHei UI", 9)
+        # 菜单变量：radiobutton/checkbutton 直接显示当前值，且与 config 双向同步
+        self.opacity_var = tk.DoubleVar(value=self.config["opacity"])
+        self.font_size_var = tk.IntVar(value=self.config["font_size"])
+        self.refresh_var = tk.IntVar(value=self.config.get("refresh_interval", 1))
+        self.auto_start_var = tk.BooleanVar(value=bool(self.config.get("auto_start")))
+
+        self.context_menu = tk.Menu(self.root, tearoff=0, font=menu_font)
         self.context_menu.add_command(label="🔓 切换锁定 / 解锁", command=self._toggle_lock)
         self.context_menu.add_separator()
 
-        opacity_menu = tk.Menu(self.context_menu, tearoff=0, font=("Microsoft YaHei UI", 9))
+        opacity_menu = tk.Menu(self.context_menu, tearoff=0, font=menu_font)
         for val, label in [(0.5, "50%"), (0.65, "65%"), (0.75, "75% (默认)"),
                            (0.85, "85%"), (0.95, "95%")]:
-            opacity_menu.add_command(label=label, command=lambda v=val: self._set_opacity(v))
+            opacity_menu.add_radiobutton(
+                label=label, variable=self.opacity_var, value=val,
+                command=lambda v=val: self._set_opacity(v))
         self.context_menu.add_cascade(label="🔅 透明度", menu=opacity_menu)
 
-        font_menu = tk.Menu(self.context_menu, tearoff=0, font=("Microsoft YaHei UI", 9))
+        font_menu = tk.Menu(self.context_menu, tearoff=0, font=menu_font)
         for size in [9, 10, 11, 12, 14, 16]:
-            font_menu.add_command(label=f"{size}px",
-                                  command=lambda s=size: self._set_font_size(s))
+            font_menu.add_radiobutton(
+                label=f"{size}px", variable=self.font_size_var, value=size,
+                command=lambda s=size: self._set_font_size(s))
         self.context_menu.add_cascade(label="🔤 字号", menu=font_menu)
 
-        refresh_menu = tk.Menu(self.context_menu, tearoff=0, font=("Microsoft YaHei UI", 9))
+        refresh_menu = tk.Menu(self.context_menu, tearoff=0, font=menu_font)
         for sec in [1, 2, 3, 5, 10]:
-            refresh_menu.add_command(label=f"{sec} 秒",
-                                     command=lambda s=sec: self._set_refresh_interval(s))
+            refresh_menu.add_radiobutton(
+                label=f"{sec} 秒", variable=self.refresh_var, value=sec,
+                command=lambda s=sec: self._set_refresh_interval(s))
         self.context_menu.add_cascade(label="⏱ 刷新间隔", menu=refresh_menu)
 
         self.context_menu.add_separator()
         self.context_menu.add_command(label="🔄 手动刷新", command=self._refresh_network)
         self.context_menu.add_command(label="📋 管理 WiFi 分类", command=self._open_wifi_manager)
-        self.context_menu.add_command(
-            label=self._auto_start_label(),
-            command=self._toggle_auto_start
-        )
-        self._auto_start_index = self.context_menu.index("end")
+        self.context_menu.add_checkbutton(
+            label="☑ 开机自动启动", variable=self.auto_start_var,
+            command=self._toggle_auto_start)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="📍 重置位置到右上角", command=self._reset_position)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="❌ 退出", command=self._quit)
 
+        # ✕ 按钮的退出确认菜单（防止误触直接退出）
+        self.confirm_menu = tk.Menu(self.root, tearoff=0, font=menu_font)
+        self.confirm_menu.add_command(label="✔ 确认退出", command=self._quit)
+        self.confirm_menu.add_command(label="✕ 取消", command=lambda: None)
+
     # ── 事件绑定 ──────────────────────────────────
     def _bind_events(self):
+        self._tooltip = _Tooltip(self.root, self._tooltip_text)
+
         for widget in [self.inner_frame, self.net_label, self.signal_canvas]:
             widget.bind("<Button-1>", self._on_drag_start)
             widget.bind("<B1-Motion>", self._on_drag_motion)
             widget.bind("<ButtonRelease-1>", self._on_drag_end)
+            widget.bind("<Enter>", self._tooltip.schedule)
+            widget.bind("<Leave>", self._tooltip.cancel)
+            widget.bind("<Button-1>", self._tooltip.cancel, add="+")
 
         for widget in [self.inner_frame, self.net_label, self.signal_canvas, self.lock_btn]:
             widget.bind("<Button-3>", self._show_context_menu)
 
         self.lock_btn.bind("<Button-1>", lambda e: None if self.config["locked"] else self._toggle_lock())
-        self.close_btn.bind("<Button-1>", lambda e: None if self.config["locked"] else self._quit())
+        self.close_btn.bind("<Button-1>", self._confirm_quit)
+
+        # 按钮悬停反馈（锁定后 ✕ 为禁用态，不响应 hover）
+        self.lock_btn.bind("<Enter>", lambda e: self.lock_btn.configure(
+            fg="#ff7a93" if self.config["locked"] else COLOR_TEXT))
+        self.lock_btn.bind("<Leave>", lambda e: self._sync_lock_visuals())
+        self.close_btn.bind("<Enter>", lambda e: None if self.config["locked"]
+                            else self.close_btn.configure(fg=COLOR_RED))
+        self.close_btn.bind("<Leave>", lambda e: self._sync_lock_visuals())
 
         self.inner_frame.bind("<MouseWheel>", self._on_scroll)
         self.net_label.bind("<MouseWheel>", self._on_scroll)
@@ -733,6 +1002,139 @@ class NetworkOverlay:
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
         except Exception:
             pass
+
+    # ── 系统托盘 ─────────────────────────────────
+    def _setup_tray(self):
+        """注册系统托盘图标：左键切换锁定，右键弹出完整菜单。
+        锁定穿透后悬浮窗不再接收任何鼠标事件，托盘是唯一操作入口。"""
+        self._tray_nid = None
+        self._tray_state = None
+        self._tray_icons = {}
+        self._old_wndproc = None
+        try:
+            hwnd = get_hwnd(self.root)
+            if not hwnd:
+                return
+            self._tray_icons = {
+                "green": _make_dot_icon(0x0076E600),  # #00e676
+                "red": _make_dot_icon(0x005252FF),    # #ff5252
+                "gray": _make_dot_icon(0x00A0A0A0),   # #a0a0a0
+            }
+            if not self._tray_icons["gray"]:
+                return
+            # 子类化窗口过程以接收托盘回调消息（实例属性保持引用防止 GC）
+            self._wndproc_cb = _WNDPROCTYPE(self._tray_wndproc)
+            self._old_wndproc = SetWindowLongPtrW(
+                hwnd, GWLP_WNDPROC,
+                ctypes.cast(self._wndproc_cb, ctypes.c_void_p).value)
+            if not self._old_wndproc:
+                return
+
+            nid = _NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+            nid.hWnd = hwnd
+            nid.uID = 1
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+            nid.uCallbackMessage = WM_TRAYICON
+            nid.hIcon = self._tray_icons["gray"]
+            nid.szTip = "网络状态悬浮窗"
+            if not ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, self._old_wndproc)
+                self._old_wndproc = None
+                return
+            nid.uVersion = 4
+            ctypes.windll.shell32.Shell_NotifyIconW(
+                NIM_SETVERSION, ctypes.byref(nid))  # 启用现代回调行为
+            self._tray_nid = nid
+        except Exception:
+            self._tray_nid = None
+
+    def _tray_wndproc(self, hwnd, msg, wparam, lparam):
+        """窗口过程：拦截托盘回调，其余消息透传原过程"""
+        if msg == WM_TRAYICON:
+            if lparam == WM_LBUTTONUP:
+                self.root.after(0, self._on_tray_left)
+            elif lparam == WM_RBUTTONUP:
+                self.root.after(0, self._on_tray_right)
+            return 0
+        return CallWindowProcW(self._old_wndproc, hwnd, msg, wparam, lparam)
+
+    def _on_tray_left(self):
+        if not self._exiting:
+            self._toggle_lock()
+
+    def _on_tray_right(self):
+        """在鼠标位置弹出完整右键菜单（锁定穿透后的主要操作入口）"""
+        try:
+            hwnd = get_hwnd(self.root)
+            pt = _POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            # 菜单弹出前置前台，否则点击他处时菜单不收起
+            user32.SetForegroundWindow(hwnd)
+            self.context_menu.tk_popup(pt.x, pt.y)
+            self.context_menu.grab_release()
+            user32.PostMessageW(hwnd, 0, 0, 0)  # WM_NULL，帮助菜单正常关闭
+        except Exception:
+            pass
+
+    def _update_tray(self, text="", is_wifi=False, ssid=None):
+        """根据网络状态切换托盘圆点颜色并更新提示文本"""
+        nid = getattr(self, "_tray_nid", None)
+        if nid is None:
+            return
+        if is_wifi and ssid:
+            cat = self.config.get("wifi_categories", {}).get(ssid)
+            state = "green" if cat == "green" else "red"
+        else:
+            state = "gray"
+        try:
+            if state != self._tray_state:
+                self._tray_state = state
+                nid.hIcon = self._tray_icons[state]
+                nid.uFlags = NIF_ICON
+                ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+        except Exception:
+            pass
+        self._update_tray_tip(text)
+
+    def _update_tray_tip(self, text=None):
+        """更新托盘悬停提示：网络名 + 锁定状态"""
+        nid = getattr(self, "_tray_nid", None)
+        if nid is None:
+            return
+        try:
+            if text is None:
+                text = self._last_status[0]
+            lock = "已锁定" if self.config["locked"] else "未锁定"
+            nid.szTip = f"{text} · {lock}"[:120]
+            nid.uFlags = NIF_TIP
+            ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+        except Exception:
+            pass
+
+    def _teardown_tray(self):
+        """移除托盘图标、恢复窗口过程、销毁图标资源"""
+        nid = getattr(self, "_tray_nid", None)
+        if nid is not None:
+            try:
+                ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+            except Exception:
+                pass
+            self._tray_nid = None
+        try:
+            hwnd = get_hwnd(self.root)
+            if hwnd and self._old_wndproc:
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, self._old_wndproc)
+                self._old_wndproc = None
+        except Exception:
+            pass
+        for hicon in getattr(self, "_tray_icons", {}).values():
+            if hicon:
+                try:
+                    user32.DestroyIcon(hicon)
+                except Exception:
+                    pass
+        self._tray_icons = {}
 
     # ── 位置 ──────────────────────────────────────
     def _resize_to_content(self):
@@ -771,6 +1173,31 @@ class NetworkOverlay:
         self.root.geometry(f"+{screen_w - 260}+20")
         self._save_position()
 
+    def _show_first_run_hint(self):
+        """首次运行时显示操作提示气泡，6 秒后自动消失"""
+        if self._exiting:
+            return
+        try:
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.wm_attributes("-topmost", 1)
+            win.configure(bg=COLOR_BORDER)
+            tk.Label(
+                win,
+                text="左键拖动移动 · 右键打开菜单 · 滚轮调透明度\n"
+                     "点击 🔒 锁定后鼠标穿透，系统托盘图标可解锁 / 弹出菜单",
+                justify=tk.LEFT,
+                font=("Microsoft YaHei UI", 9),
+                fg=COLOR_TEXT, bg=COLOR_INNER_BG,
+                padx=10, pady=6,
+            ).pack()
+            x = self.root.winfo_x()
+            y = self.root.winfo_y() + self.root.winfo_height() + 6
+            win.geometry(f"+{x}+{y}")
+            win.after(6000, lambda: win.destroy())
+        except Exception:
+            pass
+
     # ── 拖动事件 ─────────────────────────────────
     def _on_drag_start(self, event):
         if self.config["locked"]:
@@ -778,6 +1205,10 @@ class NetworkOverlay:
         self._drag_data["x"] = event.x
         self._drag_data["y"] = event.y
         self._drag_data["dragging"] = True
+        # 拖动期间边框高亮，提供明确的抓取反馈
+        self.inner_frame.configure(
+            highlightbackground=COLOR_BORDER_DRAG,
+            highlightcolor=COLOR_BORDER_DRAG)
 
     def _on_drag_motion(self, event):
         if not self._drag_data["dragging"] or self.config["locked"]:
@@ -789,6 +1220,10 @@ class NetworkOverlay:
         self.root.geometry(f"+{new_x}+{new_y}")
 
     def _on_drag_end(self, event):
+        if self._drag_data["dragging"]:
+            self.inner_frame.configure(
+                highlightbackground=COLOR_BORDER,
+                highlightcolor=COLOR_BORDER)
         self._drag_data["dragging"] = False
         self._save_position()
 
@@ -803,29 +1238,82 @@ class NetworkOverlay:
         finally:
             self.context_menu.grab_release()
 
+    def _confirm_quit(self, event):
+        """点击 ✕ 时弹出确认菜单，避免误触直接退出"""
+        if self.config["locked"]:
+            return
+        try:
+            self.confirm_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.confirm_menu.grab_release()
+
+    def _sync_lock_visuals(self):
+        """根据锁定状态同步 🔒/✕ 按钮的颜色与禁用态"""
+        locked = self.config["locked"]
+        self.lock_btn_text.set(lock_icon(locked))
+        self.lock_btn.configure(fg=COLOR_LOCKED if locked else COLOR_TEXT_DIM)
+        self.close_btn.configure(fg=COLOR_DISABLED if locked else COLOR_TEXT_DIM)
+
+    def _tooltip_text(self):
+        """生成悬停提示内容（连接类型 / 信号 / 锁定状态 / 刷新间隔）"""
+        text, is_wifi, ssid, signal = self._last_status
+        if is_wifi:
+            detail = f"WiFi：{text} · 信号 {signal}%"
+        elif ssid:
+            detail = f"有线/其他：{text}"
+        else:
+            detail = text
+        lock = "已锁定（鼠标穿透）" if self.config["locked"] else "未锁定"
+        interval = self.config.get("refresh_interval", 1)
+        return f"{detail}\n{lock} · 每 {interval}s 刷新 · 滚轮调透明度"
+
     # ── 功能 ─────────────────────────────────────
     def _toggle_lock(self):
         self.config["locked"] = not self.config["locked"]
-        self.lock_btn_text.set(lock_icon(self.config["locked"]))
-        if self.config["locked"]:
-            self.lock_btn.configure(fg="#e94560")
-        else:
-            self.lock_btn.configure(fg="#a0a0a0")
+        self._sync_lock_visuals()
+        self._set_click_through(self.config["locked"])
         save_config(self.config)
+        self._update_tray_tip()
+
+    def _set_click_through(self, enable):
+        """锁定后附加 WS_EX_TRANSPARENT 实现真正的鼠标穿透，解锁时移除"""
+        try:
+            hwnd = get_hwnd(self.root)
+            if not hwnd:
+                return
+            ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+            if enable:
+                new_style = ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT
+            else:
+                new_style = ex_style & ~WS_EX_TRANSPARENT
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style)
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+        except Exception:
+            pass
 
     def _set_opacity(self, val):
         self.config["opacity"] = val
+        self.opacity_var.set(val)
         self.root.wm_attributes("-alpha", val)
         save_config(self.config)
 
     def _set_font_size(self, size):
         self.config["font_size"] = size
-        self.net_label.configure(font=("Microsoft YaHei UI", size, "bold"))
+        self.font_size_var.set(size)
+        self._text_font = tkfont.Font(
+            family="Microsoft YaHei UI", size=size, weight="bold")
+        self.net_label.configure(font=self._text_font)
+        # 图标随字号缩放
+        icon_w, icon_h = self._icon_dims()
+        self.signal_canvas.configure(width=icon_w, height=icon_h)
         save_config(self.config)
-        self._resize_to_content()
+        self.network_text = None  # 强制按新字体重排文本与截断
+        self._refresh_network()
 
     def _set_refresh_interval(self, sec):
         self.config["refresh_interval"] = sec
+        self.refresh_var.set(sec)
         save_config(self.config)
         _set_sampling_interval(sec)
         self._schedule_refresh()
@@ -841,16 +1329,12 @@ class NetworkOverlay:
         interval_ms = self.config.get("refresh_interval", 5) * 1000
         self._refresh_job = self.root.after(interval_ms, self._refresh_network)
 
-    def _auto_start_label(self):
-        return "☑ 开机自动启动" if self.config.get("auto_start") else "☐ 开机自动启动"
-
     def _toggle_auto_start(self):
-        """切换开机自启状态"""
-        new_state = not self.config.get("auto_start", False)
+        """切换开机自启状态（由菜单 checkbutton 触发，变量值已更新）"""
+        new_state = bool(self.auto_start_var.get())
         set_auto_start(new_state)
         self.config["auto_start"] = new_state
         save_config(self.config)
-        self.context_menu.entryconfigure(self._auto_start_index, label=self._auto_start_label())
 
     def _refresh_network(self):
         """刷新网络状态显示"""
@@ -858,12 +1342,13 @@ class NetworkOverlay:
             return
         try:
             text, is_wifi, ssid, signal = get_network_status()
+            self._last_status = (text, is_wifi, ssid, signal)
             if text != self.network_text:
                 self.network_text = text
-                self.net_label.configure(text=text)
+                self.net_label.configure(text=self._truncate_text(text))
 
             # WiFi 分类颜色（始终检查，因分类可能在管理窗口中变更）
-            icon_color = "#a0a0a0"
+            icon_color = COLOR_TEXT_DIM
             icon_type = "none"
             if is_wifi and ssid:
                 icon_type = "wifi"
@@ -873,18 +1358,20 @@ class NetworkOverlay:
                     categories[ssid] = "red"
                     save_config(self.config)
                 if categories.get(ssid) == "green":
-                    icon_color = "#00e676"  # 绿色类
+                    icon_color = COLOR_GREEN  # 绿色类
                 else:
-                    icon_color = "#ff5252"  # 红色类
+                    icon_color = COLOR_RED    # 红色类
                 self.net_label.configure(fg=icon_color)
             elif ssid:
                 icon_type = "other"
-                self.net_label.configure(fg="#a0a0a0")  # 有线/其他连接 → 灰色
+                self.net_label.configure(fg=COLOR_TEXT_DIM)  # 有线/其他连接 → 灰色
             else:
-                self.net_label.configure(fg="#ff5252")  # 无网络 → 红色
+                # 无网络 → 文字灰色，错误信号由红色 ✕ 图标承担（与红色类 WiFi 区分语义）
+                self.net_label.configure(fg=COLOR_NONE_TEXT)
 
             draw_signal_icon(self.signal_canvas, icon_type, signal, icon_color)
             self._resize_to_content()
+            self._update_tray(text, is_wifi, ssid)
         except Exception:
             pass  # 静默处理刷新错误，不影响定时器继续
         self._schedule_refresh()
@@ -968,8 +1455,11 @@ class NetworkOverlay:
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
         )
-        canvas.create_window((0, 0), window=list_frame, anchor="nw")
+        canvas_win = canvas.create_window((0, 0), window=list_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
+        # 列表宽度随窗口拉伸，消除右侧留白
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(
+            canvas_win, width=e.width))
         canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(
             int(-1 * (e.delta / 120)), "units"))
 
@@ -1048,7 +1538,7 @@ class NetworkOverlay:
                 del_btn = tk.Label(
                     row,
                     text="🗑",
-                    font=("Segoe UI Symbol", 9),
+                    font=(EMOJI_FONT, 9),
                     fg="#888", bg="#16213e",
                     padx=4, cursor="hand2",
                 )
@@ -1080,14 +1570,16 @@ class NetworkOverlay:
             font=("Microsoft YaHei UI", 10, "bold"),
             fg="#e0e0e0", bg="#0f3460",
             padx=20, pady=4, cursor="hand2",
+            highlightthickness=1, highlightbackground="#3d5a80",
         )
         close_btn.pack()
         close_btn.bind("<Button-1>", lambda e: _on_mgmt_close())
         close_btn.bind("<Enter>", lambda e: close_btn.configure(bg="#1a5276"))
         close_btn.bind("<Leave>", lambda e: close_btn.configure(bg="#0f3460"))
 
-        # 按 Escape 关闭
+        # 按 Escape / Return 关闭
         win.bind("<Escape>", lambda e: _on_mgmt_close())
+        win.bind("<Return>", lambda e: _on_mgmt_close())
 
     def _quit(self):
         """退出程序 - 保存配置、释放锁、停止后台进程、销毁窗口"""
@@ -1102,6 +1594,7 @@ class NetworkOverlay:
             self._mgmt_window = None
         _stop_network_worker()
         release_lock()
+        self._teardown_tray()
         try:
             self.root.destroy()
         except Exception:
@@ -1118,7 +1611,7 @@ if __name__ == "__main__":
         try:
             user32.MessageBoxW(0,
                                "网络悬浮窗已在运行中。\n"
-                               "请查看屏幕右上角，或右键点击锁图标退出已有实例。\n"
+                               "请查看系统托盘区的悬浮窗图标（左键切换锁定，右键打开菜单）。\n"
                                "如果在任务管理器中结束 NetworkOverlay 进程后仍无法启动，\n"
                                "请删除程序目录下的 .overlay.lock 文件。",
                                APP_NAME, 0x40)
