@@ -2,8 +2,9 @@
 """
 Network Status Overlay — 屏幕网络状态悬浮窗
   - 优先显示 WiFi SSID，无 WiFi 时显示以太网/其他连接状态
-  - 解锁后可拖动，锁定后真正的鼠标穿透（不干扰游戏 / 全屏应用）
-  - 系统托盘图标：左键切换锁定，右键弹出菜单（锁定穿透后的操作入口）
+  - 解锁后可拖动，锁定后其余区域鼠标穿透（不干扰游戏 / 全屏应用），
+    锁图标仍可点击解锁
+  - 系统托盘图标：左键切换锁定，右键弹出菜单（锁定穿透时的备用操作入口）
   - 右键菜单切换锁定/解锁、透明度、字号、刷新间隔
   - 位置和状态自动保存到同目录 overlay_config.json
   - 滚轮调整透明度
@@ -14,7 +15,8 @@ Network Status Overlay — 屏幕网络状态悬浮窗
   - 或运行 启动悬浮窗.bat / 启动悬浮窗(静默).vbs
   - 右键悬浮窗打开设置菜单
   - 解锁状态（🔓）：左键拖动移动位置
-  - 锁定状态（🔒）：鼠标穿透，请通过系统托盘图标操作
+  - 锁定状态（🔒）：其余区域鼠标穿透、不会误点，仅锁图标可再次点击解锁；
+    也可用系统托盘图标左键切换，右键打开菜单
   - 在任务管理器中显示为 "NetworkOverlay" 进程
 """
 
@@ -140,6 +142,12 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TRANSPARENT = 0x00000020
 
+# 命中测试（WM_NCHITTEST）返回值，用于锁定时的选择性穿透
+WM_NCHITTEST = 0x0084
+HTCLIENT = 1
+HTNOWHERE = 0
+HTTRANSPARENT = -1
+
 user32 = ctypes.windll.user32
 
 SetWindowLongPtrW = user32.SetWindowLongPtrW
@@ -156,6 +164,10 @@ SetWindowPos.argtypes = [
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
 ]
 SetWindowPos.restype = ctypes.c_int
+
+GetAncestor = user32.GetAncestor
+GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.c_uint]
+GetAncestor.restype = ctypes.wintypes.HWND
 
 HWND_TOPMOST = -1
 SWP_NOMOVE = 0x0002
@@ -201,11 +213,17 @@ _gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
 
 
 def get_hwnd(tk_root):
-    """可靠地获取 tk 窗口的 HWND"""
+    """可靠地获取 tk 窗口的『真实顶层』HWND。
+
+    注意：winfo_id() 返回的是 Tk 内部创建的 TkChild，并不是操作系统
+    命中的那个顶层窗口；扩展样式、WM_NCHITTEST 命中测试、置顶等窗口级
+    操作都必须作用于真正的顶层 TkTopLevel（winfo_id 的根祖先），否则
+    WS_EX_TRANSPARENT / 命中测试等都不会真正生效。"""
     try:
         hwnd = tk_root.winfo_id()
         if hwnd and hwnd != 0:
-            return hwnd
+            real = GetAncestor(hwnd, 2)  # GA_ROOT = 真正顶层
+            return real or hwnd
     except Exception:
         pass
     try:
@@ -352,7 +370,15 @@ def _query_wifi():
         try:
             if iflist.contents.dwNumberOfItems == 0:
                 return None, 0
-            guid = iflist.contents.InterfaceInfo[0].InterfaceGuid
+            # 多无线网卡时优先查询“已连接”(isState==1) 的那个接口，
+            # 而不是固定取第一个
+            interfaces = iflist.contents.InterfaceInfo
+            idx = 0
+            for i in range(iflist.contents.dwNumberOfItems):
+                if interfaces[i].isState == 1:  # wlan_interface_state_connected
+                    idx = i
+                    break
+            guid = interfaces[idx].InterfaceGuid
             data = ctypes.c_void_p()
             data_size = ctypes.c_ulong()
             ret = _WlanQueryInterface(
@@ -378,7 +404,8 @@ def _query_wifi():
 
 
 def _query_other_adapter():
-    """通过 GetAdaptersAddresses 查询状态为 Up 的非 WiFi 适配器名称"""
+    """通过 GetAdaptersAddresses 查询状态为 Up 的有线/其他适配器名称。
+    优先返回真实以太网卡(IfType 6)，避免 VPN/TAP/蓝牙等虚拟适配器抢在前面。"""
     size = ctypes.c_ulong(0)
     _GetAdaptersAddresses(0, 0, None, None, ctypes.byref(size))
     if size.value == 0:
@@ -387,15 +414,21 @@ def _query_other_adapter():
     ptr = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
     if _GetAdaptersAddresses(0, 0, None, ptr, ctypes.byref(size)) != 0:
         return None
+    iftype_ethernet = 6   # IF_TYPE_ETHERNET_CSMACD
+    iftype_loopback = 24  # IF_TYPE_SOFTWARE_LOOPBACK
+    fallback = None
     cur = ptr
     while cur:
         addr = cur.contents
-        if addr.OperStatus == 1 and addr.IfType != 24:  # Up 且非 loopback
+        if addr.OperStatus == 1 and addr.IfType != iftype_loopback:
             name = addr.FriendlyName
             if name:
-                return name
+                if addr.IfType == iftype_ethernet:
+                    return name
+                if fallback is None:
+                    fallback = name
         cur = addr.Next
-    return None
+    return fallback
 
 
 def _query_network():
@@ -503,6 +536,35 @@ def load_config():
             defaults.update(data)
     except Exception:
         pass
+
+    # ── 归一化 / 容错：防止损坏、缺省或超范围配置导致异常行为 ──
+    # refresh_interval ∈ {1, 2, 3, 5, 10}
+    try:
+        defaults["refresh_interval"] = int(defaults["refresh_interval"])
+    except (TypeError, ValueError):
+        defaults["refresh_interval"] = 1
+    if defaults["refresh_interval"] not in (1, 2, 3, 5, 10):
+        defaults["refresh_interval"] = 1
+
+    # font_size ∈ [9, 16]
+    try:
+        defaults["font_size"] = int(defaults["font_size"])
+    except (TypeError, ValueError):
+        defaults["font_size"] = 9
+    defaults["font_size"] = max(9, min(16, defaults["font_size"]))
+
+    # opacity ∈ [0.2, 1.0]
+    try:
+        defaults["opacity"] = float(defaults["opacity"])
+    except (TypeError, ValueError):
+        defaults["opacity"] = 0.75
+    defaults["opacity"] = max(0.2, min(1.0, defaults["opacity"]))
+
+    defaults["locked"] = bool(defaults.get("locked"))
+    defaults["auto_start"] = bool(defaults.get("auto_start"))
+    if not isinstance(defaults.get("wifi_categories"), dict):
+        defaults["wifi_categories"] = {}
+
     return defaults
 
 
@@ -632,7 +694,7 @@ def is_auto_start_enabled():
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTO_START_REG_KEY,
                              0, winreg.KEY_READ)
         try:
-            val, regtype = winreg.QueryValueEx(key, APP_NAME)
+            val, _ = winreg.QueryValueEx(key, APP_NAME)
             return val == _get_auto_start_cmd()
         except FileNotFoundError:
             return False
@@ -710,6 +772,9 @@ NIF_TIP = 0x00000004
 WM_TRAYICON = 0x0401  # WM_USER + 1，托盘回调消息
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
+WM_CONTEXTMENU = 0x007B  # NOTIFYICON_VERSION_4 下右键改用此消息
+NIN_SELECT = 0x0400     # 部分版本左键点击以 NIN_SELECT 上报
+NIN_KEYSELECT = 0x0401
 
 
 class _NOTIFYICONDATAW(ctypes.Structure):
@@ -800,6 +865,9 @@ def _make_dot_icon(rgb):
 class NetworkOverlay:
     def __init__(self):
         self.config = load_config()
+        # 启动时把配置里的刷新间隔同步给后台采样线程（否则菜单中改过后
+        # 重启又回到默认 1 秒，后台仍然高频轮询）
+        _set_sampling_interval(self.config["refresh_interval"])
         # 启动时同步实际注册表状态到配置（防止手动删除注册表后配置残留）
         actual = is_auto_start_enabled()
         if self.config.get("auto_start") != actual:
@@ -810,6 +878,10 @@ class NetworkOverlay:
         self._refresh_job = None  # 当前刷新定时器 id（防止定时器叠加）
         self._first_run = self.config.get("x") is None  # 首次运行（无位置记录）
         self._last_status = ("检测中...", False, None, 0)  # 最近一次网络状态
+        self._click_through = False  # 锁定时选择性穿透标志
+        self._wndproc_cb = None      # 子类化窗口过程回调引用（防 GC）
+        self._old_wndproc = None     # 原窗口过程
+        self._tray_events = []       # 托盘回调暂存队列（wndproc 内禁止调 Tk，见 _tray_wndproc）
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -835,6 +907,9 @@ class NetworkOverlay:
         self._build_context_menu()
         self._bind_events()
         self._apply_window_ex_styles()
+        # 先子类化窗口过程（托盘回调 + 锁定穿透的命中测试共用），
+        # 再注册托盘；即使托盘初始化失败，锁定穿透仍可用。
+        self._install_wndproc()
         self._setup_tray()
 
         self._refresh_network()
@@ -955,6 +1030,16 @@ class NetworkOverlay:
         self.confirm_menu.add_command(label="✔ 确认退出", command=self._quit)
         self.confirm_menu.add_command(label="✕ 取消", command=lambda: None)
 
+        # 托盘右键专用菜单：“退出”放到最顶部 —— 悬浮窗一旦异常/穿透锁定，
+        # 锁图标虽可点击解锁，但托盘仍是最可靠的退出入口，必须保证能一键关闭。
+        self.tray_menu = tk.Menu(self.root, tearoff=0, font=menu_font)
+        self.tray_menu.add_command(label="❌ 退出 NetworkOverlay", command=self._quit)
+        self.tray_menu.add_separator()
+        self.tray_menu.add_command(label="🔓 切换锁定 / 解锁", command=self._toggle_lock)
+        self.tray_menu.add_command(label="📍 重置位置到右上角", command=self._reset_position)
+        self.tray_menu.add_separator()
+        self.tray_menu.add_command(label="☰ 完整设置菜单…", command=self._popup_full_menu)
+
     # ── 事件绑定 ──────────────────────────────────
     def _bind_events(self):
         self._tooltip = _Tooltip(self.root, self._tooltip_text)
@@ -970,12 +1055,15 @@ class NetworkOverlay:
         for widget in [self.inner_frame, self.net_label, self.signal_canvas, self.lock_btn]:
             widget.bind("<Button-3>", self._show_context_menu)
 
-        self.lock_btn.bind("<Button-1>", lambda e: None if self.config["locked"] else self._toggle_lock())
+        # 点击锁图标切换锁定/解锁。锁定穿透时窗口整体对命中测试透明，
+        # 但锁图标区域仍可命中（见 _selective_hit_test），所以锁定后
+        # 也能再次点击 🔒 直接解锁，无需借助托盘/右键菜单。
+        self.lock_btn.bind("<Button-1>", lambda e: self._toggle_lock())
         self.close_btn.bind("<Button-1>", self._confirm_quit)
 
-        # 按钮悬停反馈（锁定后 ✕ 为禁用态，不响应 hover）
+        # 按钮悬停反馈（锁定后 ✕ 为禁用态，不响应 hover；🔒 悬停提示可点击解锁）
         self.lock_btn.bind("<Enter>", lambda e: self.lock_btn.configure(
-            fg="#ff7a93" if self.config["locked"] else COLOR_TEXT))
+            fg=COLOR_LOCKED if self.config["locked"] else COLOR_TEXT))
         self.lock_btn.bind("<Leave>", lambda e: self._sync_lock_visuals())
         self.close_btn.bind("<Enter>", lambda e: None if self.config["locked"]
                             else self.close_btn.configure(fg=COLOR_RED))
@@ -1006,11 +1094,11 @@ class NetworkOverlay:
     # ── 系统托盘 ─────────────────────────────────
     def _setup_tray(self):
         """注册系统托盘图标：左键切换锁定，右键弹出完整菜单。
-        锁定穿透后悬浮窗不再接收任何鼠标事件，托盘是唯一操作入口。"""
+        锁定穿透后窗口不接收多数鼠标事件，托盘是最可靠的操作/关闭入口。
+        窗口过程已在 _install_wndproc 中统一子类化（托盘回调 + 命中测试）。"""
         self._tray_nid = None
         self._tray_state = None
         self._tray_icons = {}
-        self._old_wndproc = None
         try:
             hwnd = get_hwnd(self.root)
             if not hwnd:
@@ -1022,11 +1110,9 @@ class NetworkOverlay:
             }
             if not self._tray_icons["gray"]:
                 return
-            # 子类化窗口过程以接收托盘回调消息（实例属性保持引用防止 GC）
-            self._wndproc_cb = _WNDPROCTYPE(self._tray_wndproc)
-            self._old_wndproc = SetWindowLongPtrW(
-                hwnd, GWLP_WNDPROC,
-                ctypes.cast(self._wndproc_cb, ctypes.c_void_p).value)
+            # 兜底：正常流程在 __init__ 已装好窗口过程，这里仅防异常路径漏装。
+            if self._old_wndproc is None:
+                self._install_wndproc()
             if not self._old_wndproc:
                 return
 
@@ -1038,41 +1124,125 @@ class NetworkOverlay:
             nid.uCallbackMessage = WM_TRAYICON
             nid.hIcon = self._tray_icons["gray"]
             nid.szTip = "网络状态悬浮窗"
+            # 托盘注册失败时不要还原窗口过程——它同时承担锁定穿透的命中测试。
             if not ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
-                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, self._old_wndproc)
-                self._old_wndproc = None
+                self._tray_nid = None
                 return
-            nid.uVersion = 4
+            # 默认版本（0）：右键以 WM_RBUTTONUP、左键以 WM_LBUTTONUP 经回调上报，
+            # 现行 _tray_wndproc 已稳定处理。NOTIFYICON_VERSION_4 下右键回调形式不稳
+            # （lParam 或独立 WM_CONTEXTMENU 不定），会导致右键菜单打不开。
+            nid.uVersion = 0
             ctypes.windll.shell32.Shell_NotifyIconW(
-                NIM_SETVERSION, ctypes.byref(nid))  # 启用现代回调行为
+                NIM_SETVERSION, ctypes.byref(nid))  # 还原为默认回调行为
             self._tray_nid = nid
+            self._drain_tray_events()  # 启动托盘事件轮询（wndproc 只入队，这里在 Tk 循环中执行）
         except Exception:
             self._tray_nid = None
 
+    def _install_wndproc(self):
+        """子类化根窗口过程，用于：
+        1) 接收系统托盘回调消息；
+        2) 锁定时选择性命中测试（WM_NCHITTEST —— 锁图标区域仍可点击解锁）。
+        与托盘创建完全解耦：即使托盘初始化失败，锁定穿透/点击解锁依旧可用。"""
+        if self._old_wndproc is not None:
+            return
+        try:
+            hwnd = get_hwnd(self.root)
+            if not hwnd:
+                return
+            # 实例属性保持回调引用防止被 GC
+            self._wndproc_cb = _WNDPROCTYPE(self._tray_wndproc)
+            self._old_wndproc = SetWindowLongPtrW(
+                hwnd, GWLP_WNDPROC,
+                ctypes.cast(self._wndproc_cb, ctypes.c_void_p).value)
+            if not self._old_wndproc:
+                self._old_wndproc = None
+        except Exception:
+            self._old_wndproc = None
+
     def _tray_wndproc(self, hwnd, msg, wparam, lparam):
-        """窗口过程：拦截托盘回调，其余消息透传原过程"""
+        """窗口过程：拦截托盘回调与锁定时的选择性命中测试，其余透传原过程
+
+        不同 NOTIFYICON 版本下，点击消息的 lParam 不同：
+        - 默认/旧版：WM_LBUTTONUP / WM_RBUTTONUP；
+        - NOTIFYICON_VERSION_4：左键仍发 WM_LBUTTONUP，右键改为发 WM_CONTEXTMENU；
+        - 部分环境下以 NIN_SELECT / NIN_KEYSELECT 上报左键。
+
+        【重要】此回调运行在 Windows 消息派发上下文中，绝不能直接调用任何
+        Tk API（含 root.after）——实测会触发 Fatal Python error:
+        PyEval_RestoreThread（GIL 线程状态错乱）导致进程闪退（见 _tray_min* 探针）。
+        因此这里只把事件写入纯 Python 队列，由 _drain_tray_events 在正常
+        Tk 事件循环中轮询处理。WM_NCHITTEST 分支的同步 winfo 读取已验证安全。"""
         if msg == WM_TRAYICON:
-            if lparam == WM_LBUTTONUP:
-                self.root.after(0, self._on_tray_left)
-            elif lparam == WM_RBUTTONUP:
-                self.root.after(0, self._on_tray_right)
+            if lparam in (WM_LBUTTONUP, NIN_SELECT, NIN_KEYSELECT):
+                self._tray_events.append("left")
+            elif lparam in (WM_RBUTTONUP, WM_CONTEXTMENU):
+                self._tray_events.append("right")
             return 0
+        if (msg == WM_NCHITTEST and self._click_through
+                and not self._exiting):
+            return self._selective_hit_test(lparam)
         return CallWindowProcW(self._old_wndproc, hwnd, msg, wparam, lparam)
+
+    def _drain_tray_events(self):
+        """在 Tk 事件循环中轮询处理托盘回调队列（wndproc 只入队，这里出队执行）。
+        调用点均为标准 Tk 回调上下文，tk_popup 等操作安全。"""
+        events, self._tray_events = self._tray_events, []
+        for ev in events:
+            if self._exiting:
+                break
+            if ev == "left":
+                self._on_tray_left()
+            elif ev == "right":
+                self._on_tray_right()
+        if not self._exiting:
+            self.root.after(50, self._drain_tray_events)
+
+    def _selective_hit_test(self, lparam):
+        """锁定穿透时选择性命中：仅锁图标区域可点击（返回 HTCLIENT，点击解锁），
+        其余区域返回 HTTRANSPARENT 穿透给下层窗口。
+
+        lParam 高/低 16 位为带符号屏幕坐标（x | y<<16）。进程已启用 DPI
+        感知（_enable_dpi_awareness），WM_NCHITTEST 与 winfo_rootx/y 都基于
+        真实像素，坐标系一致。"""
+        try:
+            x = lparam & 0xFFFF
+            y = (lparam >> 16) & 0xFFFF
+            if x & 0x8000:
+                x -= 0x10000
+            if y & 0x8000:
+                y -= 0x10000
+            bx = self.lock_btn.winfo_rootx()
+            by = self.lock_btn.winfo_rooty()
+            bw = self.lock_btn.winfo_width()
+            bh = self.lock_btn.winfo_height()
+            if bw > 0 and bh > 0 and bx <= x < bx + bw and by <= y < by + bh:
+                return HTCLIENT
+        except Exception:
+            pass
+        return HTTRANSPARENT
 
     def _on_tray_left(self):
         if not self._exiting:
             self._toggle_lock()
 
     def _on_tray_right(self):
-        """在鼠标位置弹出完整右键菜单（锁定穿透后的主要操作入口）"""
+        """托盘右键：弹出托盘专用菜单（顶部为『退出』，是最可靠的关闭入口）"""
+        self._popup_menu(self.tray_menu)
+
+    def _popup_full_menu(self):
+        """托盘菜单中的『完整设置菜单』入口：在鼠标位置弹出完整右键菜单"""
+        self._popup_menu(self.context_menu)
+
+    def _popup_menu(self, menu):
+        """在鼠标位置弹出指定菜单（前置前台并补发 WM_NULL，保证菜单正常收起）"""
         try:
             hwnd = get_hwnd(self.root)
             pt = _POINT()
             user32.GetCursorPos(ctypes.byref(pt))
             # 菜单弹出前置前台，否则点击他处时菜单不收起
             user32.SetForegroundWindow(hwnd)
-            self.context_menu.tk_popup(pt.x, pt.y)
-            self.context_menu.grab_release()
+            menu.tk_popup(pt.x, pt.y)
             user32.PostMessageW(hwnd, 0, 0, 0)  # WM_NULL，帮助菜单正常关闭
         except Exception:
             pass
@@ -1148,15 +1318,23 @@ class NetworkOverlay:
             pass
 
     def _set_initial_position(self):
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
+        # 使用虚拟屏幕范围，支持副屏在主屏左侧/上方（坐标为负值）的场景
+        try:
+            vx = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+            vy = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+            vw = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+            vh = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        except Exception:
+            vx, vy, vw, vh = 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         x = self.config.get("x")
         y = self.config.get("y")
         if x is not None and y is not None:
-            x = max(0, min(x, screen_w - 240))
-            y = max(0, min(y, screen_h - 40))
+            # 允许负坐标，但仍在虚拟屏幕边界内
+            x = max(vx, min(x, vx + vw - 240))
+            y = max(vy, min(y, vy + vh - 40))
         else:
-            x = screen_w - 260
+            # 默认放主屏右上角
+            x = self.root.winfo_screenwidth() - 260
             y = 20
         self.root.geometry(f"+{x}+{y}")
 
@@ -1185,7 +1363,7 @@ class NetworkOverlay:
             tk.Label(
                 win,
                 text="左键拖动移动 · 右键打开菜单 · 滚轮调透明度\n"
-                     "点击 🔒 锁定后鼠标穿透，系统托盘图标可解锁 / 弹出菜单",
+                     "点击 🔒 锁定后鼠标穿透，再次点击 🔒 即可解锁 / 弹出菜单",
                 justify=tk.LEFT,
                 font=("Microsoft YaHei UI", 9),
                 fg=COLOR_TEXT, bg=COLOR_INNER_BG,
@@ -1263,7 +1441,7 @@ class NetworkOverlay:
             detail = f"有线/其他：{text}"
         else:
             detail = text
-        lock = "已锁定（鼠标穿透）" if self.config["locked"] else "未锁定"
+        lock = "已锁定（其余穿透，点击 🔒 解锁）" if self.config["locked"] else "未锁定（点击 🔒 锁定）"
         interval = self.config.get("refresh_interval", 1)
         return f"{detail}\n{lock} · 每 {interval}s 刷新 · 滚轮调透明度"
 
@@ -1276,19 +1454,32 @@ class NetworkOverlay:
         self._update_tray_tip()
 
     def _set_click_through(self, enable):
-        """锁定后附加 WS_EX_TRANSPARENT 实现真正的鼠标穿透，解锁时移除"""
+        """锁定后实现『选择性』鼠标穿透：锁图标区域保持可点击，其余全部穿透。
+
+        说明（旧实现的问题）：
+        - 旧实现给整个窗口加 WS_EX_TRANSPARENT，窗口对命中测试完全透明，
+          连锁图标也点不到——这正是『锁定后无法点击 🔒 解锁』的根源。
+        - 新实现不再加该样式，改由已子类化的窗口过程处理 WM_NCHITTEST：
+          锁图标区域返回 HTCLIENT（可点击解锁），其余返回 HTTRANSPARENT（穿透）。
+          HTTRANSPARENT 与 WS_EX_TRANSPARENT 效果相同——本窗口被命中测试跳过、
+          点击落在下层窗口；已在真实屏幕上实测对跨进程窗口同样生效。
+
+        注意：此处不要附加/断言 WS_EX_LAYERED。tkinter 通过
+        wm_attributes("-alpha") 已把窗口设为分层窗口（LWA_ALPHA），
+        这里重设 WS_EX_LAYERED 会破坏分层重定向表面，导致窗口渲染成黑块。
+        """
+        self._click_through = bool(enable)
         try:
             hwnd = get_hwnd(self.root)
             if not hwnd:
                 return
+            # 确保不残留整窗穿透样式，否则本窗口的 WM_NCHITTEST 收不到
+            # （WS_EX_TRANSPARENT 会在命中测试前直接跳过整窗）。
             ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
-            if enable:
-                new_style = ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT
-            else:
-                new_style = ex_style & ~WS_EX_TRANSPARENT
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style)
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+            if ex_style & WS_EX_TRANSPARENT:
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_TRANSPARENT)
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
         except Exception:
             pass
 
