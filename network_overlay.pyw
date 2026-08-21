@@ -810,6 +810,11 @@ class _POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
 _WNDPROCTYPE = ctypes.WINFUNCTYPE(
     ctypes.c_longlong, ctypes.wintypes.HWND, ctypes.c_uint,
     ctypes.c_size_t, ctypes.c_ssize_t)
@@ -1040,6 +1045,10 @@ class NetworkOverlay:
         self.tray_menu.add_separator()
         self.tray_menu.add_command(label="☰ 完整设置菜单…", command=self._popup_full_menu)
 
+        # 全部菜单集合（含级联子菜单），用于“左键不落在菜单上就关闭”的命中判断
+        self._all_menus = [self.context_menu, self.tray_menu, self.confirm_menu,
+                           opacity_menu, font_menu, refresh_menu]
+
     # ── 事件绑定 ──────────────────────────────────
     def _bind_events(self):
         self._tooltip = _Tooltip(self.root, self._tooltip_text)
@@ -1235,7 +1244,10 @@ class NetworkOverlay:
         self._popup_menu(self.context_menu)
 
     def _popup_menu(self, menu):
-        """在鼠标位置弹出指定菜单（前置前台并补发 WM_NULL，保证菜单正常收起）"""
+        """在鼠标位置弹出指定菜单（前置前台并补发 WM_NULL，保证菜单正常收起）。
+        弹出后启动 _monitor_menu_close：只要左键不落在菜单上（桌面/其他程序/
+        悬浮窗），就关闭菜单——本窗口为 noactivate 工具窗，Tk 依赖焦点丢失的
+        自动关闭机制在此失效，需主动轮询检测。"""
         try:
             hwnd = get_hwnd(self.root)
             pt = _POINT()
@@ -1244,8 +1256,46 @@ class NetworkOverlay:
             user32.SetForegroundWindow(hwnd)
             menu.tk_popup(pt.x, pt.y)
             user32.PostMessageW(hwnd, 0, 0, 0)  # WM_NULL，帮助菜单正常关闭
+            self._monitor_menu_close(menu)
         except Exception:
             pass
+
+    def _monitor_menu_close(self, menu, prev_down=False):
+        """轮询监控菜单：检测左键“按下沿”，若按下位置不落在任何可见菜单
+        （含级联子菜单）上，则关闭该菜单并结束监控。菜单被选中自动收起或
+        程序退出时同样结束。"""
+        if self._exiting:
+            return
+        try:
+            if not menu.winfo_ismapped():
+                return  # 菜单已被选中/收起
+            down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)  # VK_LBUTTON
+            if down and not prev_down:  # 左键按下沿
+                pt = _POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                if not self._point_on_menu(pt.x, pt.y):
+                    menu.unpost()
+                    return
+            self.root.after(40, lambda: self._monitor_menu_close(menu, down))
+        except Exception:
+            pass
+
+    def _point_on_menu(self, x, y):
+        """判断屏幕坐标 (x, y) 是否落在任一可见菜单窗口的矩形内"""
+        for m in getattr(self, "_all_menus", ()):
+            try:
+                if not m.winfo_ismapped():
+                    continue
+                h = m.winfo_id()
+                if not h:
+                    continue
+                rect = _RECT()
+                if user32.GetWindowRect(h, ctypes.byref(rect)):
+                    if rect.left <= x < rect.right and rect.top <= y < rect.bottom:
+                        return True
+            except Exception:
+                continue
+        return False
 
     def _update_tray(self, text="", is_wifi=False, ssid=None):
         """根据网络状态切换托盘圆点颜色并更新提示文本"""
@@ -1411,19 +1461,13 @@ class NetworkOverlay:
         self._set_opacity(max(0.2, min(1.0, new_val)))
 
     def _show_context_menu(self, event):
-        try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.context_menu.grab_release()
+        self._popup_menu(self.context_menu)
 
     def _confirm_quit(self, event):
         """点击 ✕ 时弹出确认菜单，避免误触直接退出"""
         if self.config["locked"]:
             return
-        try:
-            self.confirm_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.confirm_menu.grab_release()
+        self._popup_menu(self.confirm_menu)
 
     def _sync_lock_visuals(self):
         """根据锁定状态同步 🔒/✕ 按钮的颜色与禁用态"""
